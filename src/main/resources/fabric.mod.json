@@ -1,0 +1,36 @@
+{
+	"schemaVersion": 1,
+	"id": "voxeltracing",
+	"version": "${version}",
+	"name": "Voxel Tracing",
+	"description": "Fast voxel-based ray-traced shadows and block light for Minecraft. Independent of vanilla lighting, built to run on low-end CPUs.",
+	"authors": [
+		"realdiplad"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/voxeltracing/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"realdiplad.voxeltracing.Voxeltracing"
+		],
+		"client": [
+			"realdiplad.voxeltracing.client.VoxeltracingClient"
+		]
+	},
+	"mixins": [
+		{
+			"config": "voxeltracing.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~1.20.1",
+		"java": ">=17",
+		"fabric-api": "*"
+	}
+}
