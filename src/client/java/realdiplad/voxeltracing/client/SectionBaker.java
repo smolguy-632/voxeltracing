@@ -4,23 +4,25 @@ import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
 import java.util.Arrays;
 
 /**
  * Turns one VoxelSection into an overlay mesh.
  *
- * For every exposed face of every opaque block we look at the air voxel in front of it and ask:
- *   - sun:   is there an unobstructed voxel-ray from that voxel to the sun?
- *   - light: which nearby emitters can that voxel see (voxel-ray), and which ones are blocked?
- * The answers are memoised per air voxel (a voxel in front of several faces is traced once).
- * Faces that end up visibly shadowed / lit become one translucent quad; everything else emits nothing.
+ * Lighting is evaluated per corner vertex, not per face: for every exposed face of every opaque
+ * block, a voxel-ray is traced from each of the four corner positions (exact world-space block
+ * corners) to the sun, and to the nearby emitters. Corner positions are shared by neighbouring
+ * faces and blocks, so the results are memoised in a hashmap keyed by the packed corner position
+ * for the duration of one section bake - every unique corner is traced exactly once and the cost
+ * stays comparable to the old per-voxel memo while faces meet in smooth gradients.
+ * Faces that end up visibly shadowed / lit become one translucent quad with per-vertex colour;
+ * everything else emits nothing.
  */
 final class SectionBaker {
 	private static final float EPS = 0.003f;
 	private static final int MAX_CAND = 128;
-	private static final int MEMO_DIM = 18;                 // 16 + 1 voxel border each side
-	private static final int MEMO_SIZE = MEMO_DIM * MEMO_DIM * MEMO_DIM;
 
 	// Face order: DOWN, UP, NORTH(-Z), SOUTH(+Z), WEST(-X), EAST(+X)
 	private static final int[] DX = {0, 0, 0, 0, -1, 1};
@@ -42,12 +44,11 @@ final class SectionBaker {
 	private final VoxelLighting vl;
 	private BufferBuilder builder;
 
-	private final float[] sunMemo = new float[MEMO_SIZE];
-	private final float[] bMemo = new float[MEMO_SIZE];
-	private final float[] pMemo = new float[MEMO_SIZE];
+	/** Per-bake cache: packed corner position -> traced light. Corners are shared, trace once. */
+	private final Long2ObjectOpenHashMap<Vert> vcache = new Long2ObjectOpenHashMap<>();
 
 	private int[] qPos = new int[8192];
-	private int[] qCol = new int[8192];
+	private int[] qCol = new int[8192 * 4]; // 4 vertex colours per quad
 	private int quads;
 
 	// Emitter candidates for the section being baked
@@ -59,8 +60,30 @@ final class SectionBaker {
 	private final float[] bestStr = new float[8];
 	private final int[] bestIdx = new int[8];
 
+	/** Traced light of one corner vertex. -1 means "not computed yet". */
+	private static final class Vert {
+		float sunT = -1f; // transmittance towards the sun
+		float b = -1f;    // torch light that actually arrives
+		float p;          // torch light that would arrive with no blockers
+	}
+
 	SectionBaker(VoxelLighting vl) {
 		this.vl = vl;
+	}
+
+	/** BlockPos.asLong layout: 26 bits x, 12 bits y, 26 bits z. */
+	private static long vkey(int x, int y, int z) {
+		return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | (long) (y & 0xFFF);
+	}
+
+	private Vert vertex(int x, int y, int z) {
+		long k = vkey(x, y, z);
+		Vert v = vcache.get(k);
+		if (v == null) {
+			v = new Vert();
+			vcache.put(k, v);
+		}
+		return v;
 	}
 
 	void bake(VoxelSection s, VtConfig cfg) {
@@ -82,8 +105,7 @@ final class SectionBaker {
 			return;
 		}
 
-		Arrays.fill(sunMemo, -1f);
-		Arrays.fill(bMemo, -1f);
+		vcache.clear();
 
 		final float strength = vl.sunStrength;
 		final float lx = vl.lx, ly = vl.ly, lz = vl.lz;
@@ -113,50 +135,62 @@ final class SectionBaker {
 						continue;
 					}
 
-					int wx = bx + nx, wz = bz + nz;
-					int mi = (nx + 1) + MEMO_DIM * ((ny + 1) + MEMO_DIM * (nz + 1));
+					// ---- light the four corner vertices (shared corners come from the cache)
+					float dot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
+					int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+					float maxSum = 0f;
+					for (int v = 0; v < 4; v++) {
+						int vx = bx + x + FACE[d][v][0];
+						int vy = by + y + FACE[d][v][1];
+						int vz = bz + z + FACE[d][v][2];
 
-					// ---- sun
-					float sunA = 0f;
-					if (sunOn) {
-						float dot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
-						if (dot <= 0f) {
-							sunA = cfg.selfShade;
-						} else {
-							float t = sunMemo[mi];
-							if (t < 0f) {
-								t = vl.trace(wx + 0.5, wy + 0.5, wz + 0.5, lx, ly, lz, range,
-									VoxelLighting.NO_TARGET, 0, 0);
-								sunMemo[mi] = t;
+						// ---- sun (per vertex)
+						float sunA = 0f;
+						if (sunOn) {
+							if (dot <= 0f) {
+								sunA = cfg.selfShade;
+							} else {
+								Vert vt = vertex(vx, vy, vz);
+								if (vt.sunT < 0f) {
+									vt.sunT = vl.trace(vx, vy, vz, lx, ly, lz, range,
+										VoxelLighting.NO_TARGET, 0, 0);
+								}
+								sunA = (1f - vt.sunT) * cfg.shadowStrength;
 							}
-							sunA = (1f - t) * cfg.shadowStrength;
+							sunA *= strength;
 						}
-						sunA *= strength;
-					}
 
-					// ---- block light
-					float b = 0f, p = 0f;
-					if (lightOn) {
-						b = bMemo[mi];
-						if (b < 0f) {
-							lightVoxel(wx, wy, wz, mi, cfg);
-							b = bMemo[mi];
+						// ---- block light (per vertex)
+						float b = 0f, p = 0f;
+						if (lightOn) {
+							Vert vt = vertex(vx, vy, vz);
+							if (vt.b < 0f) vertexLight(vx, vy, vz, vt, cfg);
+							b = vt.b;
+							p = vt.p;
 						}
-						p = pMemo[mi];
+
+						float dark = 1f - (1f - sunA * (1f - b)) * (1f - (p - b) * cfg.torchShadow);
+						float warm = b * cfg.warmStrength;
+						float sum = dark + warm;
+						if (sum > maxSum) maxSum = sum;
+
+						int col = 0;
+						if (sum >= 0.02f) {
+							float a = Math.min(0.8f, sum);
+							float wgt = warm / sum;
+							col = ((int) (WR * wgt))
+								| ((int) (WG * wgt) << 8)
+								| ((int) (WB * wgt) << 16)
+								| ((int) (a * 255f) << 24);
+						}
+						if (v == 0) c0 = col;
+						else if (v == 1) c1 = col;
+						else if (v == 2) c2 = col;
+						else c3 = col;
 					}
+					if (maxSum < 0.02f) continue;
 
-					float dark = 1f - (1f - sunA * (1f - b)) * (1f - (p - b) * cfg.torchShadow);
-					float warm = b * cfg.warmStrength;
-					float sum = dark + warm;
-					if (sum < 0.02f) continue;
-
-					float a = Math.min(0.8f, sum);
-					float wgt = warm / sum;
-					int col = ((int) (WR * wgt))
-						| ((int) (WG * wgt) << 8)
-						| ((int) (WB * wgt) << 16)
-						| ((int) (a * 255f) << 24);
-					addQuad(x | (y << 4) | (z << 8) | (d << 12), col);
+					addQuad(x | (y << 4) | (z << 8) | (d << 12), c0, c1, c2, c3);
 				}
 			}
 		}
@@ -201,9 +235,9 @@ final class SectionBaker {
 		}
 	}
 
-	/** Fills bMemo (light that actually arrives) and pMemo (light that would arrive with no blockers). */
-	private void lightVoxel(int wx, int wy, int wz, int mi, VtConfig cfg) {
-		final float ox = wx + 0.5f, oy = wy + 0.5f, oz = wz + 0.5f;
+	/** Traces the nearby emitters from one corner vertex; fills v.b (arrives) and v.p (no blockers). */
+	private void vertexLight(int wx, int wy, int wz, Vert v, VtConfig cfg) {
+		final float ox = wx, oy = wy, oz = wz;
 		final int kmax = Math.min(cfg.quality.lightRays, 8);
 		int k = 0;
 		for (int c = 0; c < candCount; c++) {
@@ -238,19 +272,22 @@ final class SectionBaker {
 			keepP *= 1f - str;
 			keepB *= 1f - str * t;
 		}
-		bMemo[mi] = 1f - keepB;
-		pMemo[mi] = 1f - keepP;
+		v.b = 1f - keepB;
+		v.p = 1f - keepP;
 	}
 
 	// ------------------------------------------------------------------ mesh
 
-	private void addQuad(int pos, int col) {
+	private void addQuad(int pos, int c0, int c1, int c2, int c3) {
 		if (quads == qPos.length) {
 			qPos = Arrays.copyOf(qPos, quads * 2);
-			qCol = Arrays.copyOf(qCol, quads * 2);
+			qCol = Arrays.copyOf(qCol, quads * 8);
 		}
 		qPos[quads] = pos;
-		qCol[quads] = col;
+		qCol[quads * 4] = c0;
+		qCol[quads * 4 + 1] = c1;
+		qCol[quads * 4 + 2] = c2;
+		qCol[quads * 4 + 3] = c3;
 		quads++;
 	}
 
@@ -264,11 +301,11 @@ final class SectionBaker {
 		for (int q = 0; q < quads; q++) {
 			int p = qPos[q];
 			int x = p & 15, y = (p >> 4) & 15, z = (p >> 8) & 15, d = (p >> 12) & 7;
-			int c = qCol[q];
-			int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >>> 24) & 255;
 			float ox = DX[d] * EPS, oy = DY[d] * EPS, oz = DZ[d] * EPS;
 			int[][] f = FACE[d];
 			for (int v = 0; v < 4; v++) {
+				int c = qCol[q * 4 + v];
+				int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >>> 24) & 255;
 				builder.vertex(x + f[v][0] + ox, y + f[v][1] + oy, z + f[v][2] + oz)
 					.color(r, g, b, a)
 					.endVertex();
