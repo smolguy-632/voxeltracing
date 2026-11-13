@@ -15,17 +15,19 @@ import java.util.ArrayList;
 
 /**
  * Owns all voxel data and does the work:
- *  - section storage (opacity bitsets) + a 3D-DDA voxel ray marcher
+ *  - section storage (16x16x16 sub-voxel grid per block) + a 3D-DDA voxel ray marcher
  *  - sun model (quantised so shadows are rebaked rarely, not every tick)
  *  - a priority queue of sections to (re)bake, drained under a strict per-frame time budget
  * Everything runs on the render thread, so there is no locking.
+ *
+ * Rays march on the per-block 16x16x16 grid: partial shapes (stairs, slabs, fences, panes...)
+ * are walked sub-voxel by sub-voxel, and light passing through glass is attenuated and
+ * coloured per channel (see VoxelSection.attenuate).
  */
 public final class VoxelLighting {
 	public static final VoxelLighting INSTANCE = new VoxelLighting();
 
-	static final float FOLIAGE_T = 0.55f;
 	static final int NO_SUN = -1;
-	static final int NO_TARGET = Integer.MIN_VALUE;
 
 	final Long2ObjectOpenHashMap<VoxelSection> sections = new Long2ObjectOpenHashMap<>();
 	ClientLevel level;
@@ -38,6 +40,9 @@ public final class VoxelLighting {
 	// Camera section
 	int camSx = Integer.MIN_VALUE, camSy, camSz;
 
+	/** RGB transmittance of the last trace() call. */
+	float trR = 1f, trG = 1f, trB = 1f;
+
 	private final SectionBaker baker = new SectionBaker(this);
 	private final ArrayList<VoxelSection> queue = new ArrayList<>();
 	private int queueHead;
@@ -46,6 +51,8 @@ public final class VoxelLighting {
 	// One-entry section cache for the ray marcher
 	private VoxelSection cacheSec;
 	private int cSx, cSy, cSz;
+
+	private final float[] acc = new float[3];
 
 	private VoxelLighting() {
 	}
@@ -262,38 +269,34 @@ public final class VoxelLighting {
 		return s;
 	}
 
-	/** 0 = fully opaque, 1 = fully transparent. Unknown / unloaded space counts as open. */
-	float transmittance(int x, int y, int z) {
-		int sx = x >> 4, sy = y >> 4, sz = z >> 4;
-		VoxelSection s;
-		if (cacheSec != null && sx == cSx && sy == cSy && sz == cSz) {
-			s = cacheSec;
-		} else {
-			s = getSection(sx, sy, sz, true);
-			cacheSec = s;
-			cSx = sx;
-			cSy = sy;
-			cSz = sz;
-		}
-		if (s == null || s.opaque == null) return 1f;
-		int i = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
-		long m = 1L << i; // shift distance is taken mod 64
-		int w = i >>> 6;
-		if ((s.opaque[w] & m) != 0L) return 0f;
-		return (s.foliage[w] & m) != 0L ? FOLIAGE_T : 1f;
+	boolean isOpaque(int x, int y, int z) {
+		VoxelSection s = section(x, y, z);
+		if (s == null || s.opaque == null) return false;
+		int bi = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+		return (s.opaque[bi >>> 6] & (1L << bi)) != 0L;
 	}
 
-	boolean isOpaque(int x, int y, int z) {
-		return transmittance(x, y, z) == 0f;
+	private VoxelSection section(int x, int y, int z) {
+		int sx = x >> 4, sy = y >> 4, sz = z >> 4;
+		if (cacheSec != null && sx == cSx && sy == cSy && sz == cSz) return cacheSec;
+		VoxelSection s = getSection(sx, sy, sz, true);
+		cacheSec = s;
+		cSx = sx;
+		cSy = sy;
+		cSz = sz;
+		return s;
 	}
 
 	/**
-	 * Amanatides-Woo voxel traversal from (ox,oy,oz) along a UNIT direction for maxLen blocks.
-	 * The start voxel is assumed open. Stops early when it enters the target voxel (tx,ty,tz).
-	 * Returns the fraction of light that gets through: 0 if blocked, 1 if clear, in-between for foliage.
+	 * Amanatides-Woo traversal on the per-block 16x16x16 grid, from (ox,oy,oz) along a UNIT
+	 * direction for maxLen blocks. The start block is assumed open. Stops early when it enters
+	 * the target block (tx,ty,tz). Every block is evaluated on the sub-voxel grid; light passing
+	 * through partial shapes and glass is attenuated / coloured per channel.
+	 * Results land in trR/trG/trB.
 	 */
-	float trace(double ox, double oy, double oz, double dx, double dy, double dz, double maxLen,
-				int tx, int ty, int tz) {
+	void trace(double ox, double oy, double oz, double dx, double dy, double dz, double maxLen,
+			   int tx, int ty, int tz) {
+		acc[0] = acc[1] = acc[2] = 1f;
 		int x = Mth.floor(ox), y = Mth.floor(oy), z = Mth.floor(oz);
 		int stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
 		final double inf = Double.POSITIVE_INFINITY;
@@ -305,7 +308,6 @@ public final class VoxelLighting {
 		double tMaxZ = dz > 0 ? (z + 1 - oz) * invZ : dz < 0 ? (oz - z) * invZ : inf;
 
 		final int minY = level.getMinBuildHeight(), maxY = level.getMaxBuildHeight();
-		float t = 1f;
 		while (true) {
 			double tn;
 			if (tMaxX < tMaxY) {
@@ -327,14 +329,30 @@ public final class VoxelLighting {
 				z += stepZ;
 				tMaxZ += invZ;
 			}
-			if (tn > maxLen) return t;
-			if (y < minY || y >= maxY) return t; // left the world vertically: nothing more to hit
-			if (x == tx && y == ty && z == tz) return t;
-			float tr = transmittance(x, y, z);
-			if (tr < 1f) {
-				t *= tr;
-				if (t < 0.06f) return 0f;
+			if (tn > maxLen) break;
+			if (y < minY || y >= maxY) break; // left the world vertically: nothing more to hit
+			if (x == tx && y == ty && z == tz) break; // arrived at the emitter block
+
+			// The exit of the current block is the next crossing, whichever it is.
+			double exitD = Math.min(tMaxX, Math.min(tMaxY, tMaxZ));
+			double len = Math.min(exitD, maxLen) - tn;
+			if (len > 0) {
+				VoxelSection s = section(x, y, z);
+				if (s != null && s.loadState == VoxelSection.READY && (s.opaque != null || s.ptype != null
+						|| s.foliage != null || s.glass != null)) {
+					double lx = ox + dx * tn - ((x >> 4) << 4);
+					double ly = oy + dy * tn - ((y >> 4) << 4);
+					double lz = oz + dz * tn - ((z >> 4) << 4);
+					int bi = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+					if (!s.attenuate(bi, lx, ly, lz, dx, dy, dz, len, acc)) {
+						acc[0] = acc[1] = acc[2] = 0f;
+						break;
+					}
+				}
 			}
 		}
+		trR = acc[0];
+		trG = acc[1];
+		trB = acc[2];
 	}
 }

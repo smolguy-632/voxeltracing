@@ -17,6 +17,12 @@ import java.util.Arrays;
  * faces and blocks, so the results are memoised in a hashmap keyed by the packed corner position
  * for the duration of one section bake - every unique corner is traced exactly once and the cost
  * stays comparable to the old per-voxel memo while faces meet in smooth gradients.
+ *
+ * Rays resolve on the per-block 16x16x16 sub-voxel grid and carry an RGB transmittance, so
+ * shadows from partial shapes (stairs, slabs, fences, panes...) are true to their silhouette
+ * and stained glass tints both the sun shadows and the torch glow beneath it. The per-channel
+ * darkness collapses into one translucent quad: channels that pass more light lift the overlay
+ * colour, which reads as coloured light inside the shadow.
  * Faces that end up visibly shadowed / lit become one translucent quad with per-vertex colour;
  * everything else emits nothing.
  */
@@ -38,8 +44,8 @@ final class SectionBaker {
 		{{1, 0, 1}, {1, 0, 0}, {1, 1, 0}, {1, 1, 1}},
 	};
 
-	// Warm light colour
-	private static final int WR = 255, WG = 176, WB = 96;
+	// Warm light colour (normalised)
+	private static final float[] WARMN = {1f, 176f / 255f, 96f / 255f};
 
 	private final VoxelLighting vl;
 	private BufferBuilder builder;
@@ -60,11 +66,11 @@ final class SectionBaker {
 	private final float[] bestStr = new float[8];
 	private final int[] bestIdx = new int[8];
 
-	/** Traced light of one corner vertex. -1 means "not computed yet". */
+	/** Traced light of one corner vertex. A -1 sentinel on sunR / bR means "not computed yet". */
 	private static final class Vert {
-		float sunT = -1f; // transmittance towards the sun
-		float b = -1f;    // torch light that actually arrives
-		float p;          // torch light that would arrive with no blockers
+		float sunR = -1f, sunG, sunB; // transmittance towards the sun, per channel
+		float bR = -1f, bG, bB;       // torch light that actually arrives, per channel
+		float p;                      // torch light that would arrive with no blockers
 	}
 
 	SectionBaker(VoxelLighting vl) {
@@ -144,44 +150,64 @@ final class SectionBaker {
 						int vy = by + y + FACE[d][v][1];
 						int vz = bz + z + FACE[d][v][2];
 
-						// ---- sun (per vertex)
-						float sunA = 0f;
+						// ---- sun (per vertex, per channel)
+						float sr = 0f, sg = 0f, sb = 0f;
 						if (sunOn) {
 							if (dot <= 0f) {
-								sunA = cfg.selfShade;
+								sr = sg = sb = cfg.selfShade;
 							} else {
 								Vert vt = vertex(vx, vy, vz);
-								if (vt.sunT < 0f) {
-									vt.sunT = vl.trace(vx, vy, vz, lx, ly, lz, range,
-										VoxelLighting.NO_TARGET, 0, 0);
+								if (vt.sunR < 0f) {
+									vl.trace(vx, vy, vz, lx, ly, lz, range,
+											VoxelLighting.NO_TARGET, 0, 0);
+									vt.sunR = vl.trR;
+									vt.sunG = vl.trG;
+									vt.sunB = vl.trB;
 								}
-								sunA = (1f - vt.sunT) * cfg.shadowStrength;
+								sr = (1f - vt.sunR) * cfg.shadowStrength;
+								sg = (1f - vt.sunG) * cfg.shadowStrength;
+								sb = (1f - vt.sunB) * cfg.shadowStrength;
 							}
-							sunA *= strength;
+							sr *= strength;
+							sg *= strength;
+							sb *= strength;
 						}
 
-						// ---- block light (per vertex)
-						float b = 0f, p = 0f;
+						// ---- block light (per vertex, per channel)
+						float br = 0f, bg = 0f, bb = 0f, p = 0f;
 						if (lightOn) {
 							Vert vt = vertex(vx, vy, vz);
-							if (vt.b < 0f) vertexLight(vx, vy, vz, vt, cfg);
-							b = vt.b;
+							if (vt.bR < 0f) vertexLight(vx, vy, vz, vt, cfg);
+							br = vt.bR;
+							bg = vt.bG;
+							bb = vt.bB;
 							p = vt.p;
 						}
 
-						float dark = 1f - (1f - sunA * (1f - b)) * (1f - (p - b) * cfg.torchShadow);
-						float warm = b * cfg.warmStrength;
-						float sum = dark + warm;
+						// Per-channel darkness (sun occlusion + torch occlusion) and warm glow.
+						float dr = 1f - (1f - sr * (1f - br)) * (1f - (p - br) * cfg.torchShadow);
+						float dg = 1f - (1f - sg * (1f - bg)) * (1f - (p - bg) * cfg.torchShadow);
+						float db = 1f - (1f - sb * (1f - bb)) * (1f - (p - bb) * cfg.torchShadow);
+						float wr = br * cfg.warmStrength * WARMN[0];
+						float wg = bg * cfg.warmStrength * WARMN[1];
+						float wb = bb * cfg.warmStrength * WARMN[2];
+
+						float aD = Math.max(dr, Math.max(dg, db));
+						float a = Math.min(0.8f, aD + Math.max(wr, Math.max(wg, wb)));
+						float sum = aD + Math.max(wr, Math.max(wg, wb));
 						if (sum > maxSum) maxSum = sum;
 
 						int col = 0;
-						if (sum >= 0.02f) {
-							float a = Math.min(0.8f, sum);
-							float wgt = warm / sum;
-							col = ((int) (WR * wgt))
-								| ((int) (WG * wgt) << 8)
-								| ((int) (WB * wgt) << 16)
-								| ((int) (a * 255f) << 24);
+						if (a >= 0.02f) {
+							// Channels that pass more light lift the overlay colour: that reads
+							// as coloured light inside the shadow. Warm glow adds its own tint.
+							float rr = clamp01((aD - dr) / a + wr / a);
+							float gr = clamp01((aD - dg) / a + wg / a);
+							float brr = clamp01((aD - db) / a + wb / a);
+							col = ((int) (rr * 255f))
+									| ((int) (gr * 255f) << 8)
+									| ((int) (brr * 255f) << 16)
+									| ((int) (a * 255f) << 24);
 						}
 						if (v == 0) c0 = col;
 						else if (v == 1) c1 = col;
@@ -196,6 +222,10 @@ final class SectionBaker {
 		}
 
 		upload(s);
+	}
+
+	private static float clamp01(float v) {
+		return v < 0f ? 0f : v > 1f ? 1f : v;
 	}
 
 	// ------------------------------------------------------------------ light
@@ -235,7 +265,7 @@ final class SectionBaker {
 		}
 	}
 
-	/** Traces the nearby emitters from one corner vertex; fills v.b (arrives) and v.p (no blockers). */
+	/** Traces the nearby emitters from one corner vertex; fills v.b* (arrives) and v.p (no blockers). */
 	private void vertexLight(int wx, int wy, int wz, Vert v, VtConfig cfg) {
 		final float ox = wx, oy = wy, oz = wz;
 		final int kmax = Math.min(cfg.quality.lightRays, 8);
@@ -258,21 +288,28 @@ final class SectionBaker {
 			}
 		}
 
-		float keepB = 1f, keepP = 1f;
+		float keepB_r = 1f, keepB_g = 1f, keepB_b = 1f, keepP = 1f;
 		for (int i = 0; i < k; i++) {
 			int c = bestIdx[i];
 			float str = bestStr[i];
-			float t = 1f;
+			float tr = 1f, tg = 1f, tb = 1f;
 			if (!(cbx[c] == wx && cby[c] == wy && cbz[c] == wz)) {
 				float dx = cx[c] - ox, dy = cy[c] - oy, dz = cz[c] - oz;
 				float dist = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
 				float inv = 1f / dist;
-				t = vl.trace(ox, oy, oz, dx * inv, dy * inv, dz * inv, dist, cbx[c], cby[c], cbz[c]);
+				vl.trace(ox, oy, oz, dx * inv, dy * inv, dz * inv, dist, cbx[c], cby[c], cbz[c]);
+				tr = vl.trR;
+				tg = vl.trG;
+				tb = vl.trB;
 			}
 			keepP *= 1f - str;
-			keepB *= 1f - str * t;
+			keepB_r *= 1f - str * tr;
+			keepB_g *= 1f - str * tg;
+			keepB_b *= 1f - str * tb;
 		}
-		v.b = 1f - keepB;
+		v.bR = 1f - keepB_r;
+		v.bG = 1f - keepB_g;
+		v.bB = 1f - keepB_b;
 		v.p = 1f - keepP;
 	}
 
@@ -307,8 +344,8 @@ final class SectionBaker {
 				int c = qCol[q * 4 + v];
 				int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >>> 24) & 255;
 				builder.vertex(x + f[v][0] + ox, y + f[v][1] + oy, z + f[v][2] + oz)
-					.color(r, g, b, a)
-					.endVertex();
+						.color(r, g, b, a)
+						.endVertex();
 			}
 		}
 		BufferBuilder.RenderedBuffer rb = builder.end();
