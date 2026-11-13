@@ -44,6 +44,8 @@ Settings live in `config/voxeltracing.properties` (quality, strengths, sunShadow
 - All baking is on the render thread under a hard per-frame budget (0.8 / 1.5 / 2.5 ms for LOW / MEDIUM / HIGH),
   nearest sections first, so it can never stall a frame for long.
 - Results are static VBOs: per frame it is one frustum test and one draw call per visible section.
+- Shadowed faces are greedily merged into rectangles per plane (shade is quantised first), so a wall of
+  shadow is a handful of polygons instead of one quad per face.
 - Faces facing away from the sun need no ray; air voxels shared by several faces are traced once.
 - Fully buried faces, empty sections and distant sections cost nothing.
 
