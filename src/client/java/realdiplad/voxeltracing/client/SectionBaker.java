@@ -12,11 +12,13 @@ import java.util.Arrays;
 /**
  * Turns one VoxelSection into an overlay mesh.
  *
- * Every exposed block face is split into a 4x4 grid of sub-quads (one sub-quad = 1/4 block =
- * 4 texture pixels). Light is traced at each sub-quad corner: a ray towards the sun and rays to
- * the nearby emitters. Corner results are memoised by exact world position (1/4-block fixed
- * point), so corners shared by neighbouring sub-quads, faces and blocks are traced exactly once
- * and neighbouring quads stay seam-free while shadow edges stay sharp at 1/4-block resolution.
+ * Every exposed block face is shaded at true texture-pixel resolution: the face is treated as a
+ * 16x16 grid (one cell = one texture pixel) and refined with a quadtree. Each region's four
+ * corners are traced towards the sun / nearby emitters; identical corners merge into one quad,
+ * anything that differs subdivides further, down to single-pixel quads along shadow edges.
+ * Flat-lit faces stay one quad, so the cost concentrates exactly where detail lives.
+ * Corner results are memoised by exact world position (1/16-block fixed point), keeping
+ * neighbouring quads seam-free.
  *
  * Rays resolve on the per-block 16x16x16 sub-voxel grid and carry an RGB transmittance, so
  * shadows from partial shapes (stairs, slabs, fences, panes...) are true to their silhouette
@@ -27,9 +29,9 @@ import java.util.Arrays;
 final class SectionBaker {
 	private static final float EPS = 0.003f;
 	private static final int MAX_CAND = 128;
-	/** Sub-quads per block face axis (4x4 = 16 sub-quads of 1/4 block each). */
-	private static final int SUB = 4;
-	private static final float SUBF = 1f / SUB;
+	/** Texture-pixel resolution: subdivisions per block face axis. */
+	private static final int RES = 16;
+	private static final float RESF = 1f / RES;
 	private static final int[] UC = {0, 1, 1, 0}, VC = {0, 0, 1, 1};
 
 	// Face order: DOWN, UP, NORTH(-Z), SOUTH(+Z), WEST(-X), EAST(+X)
@@ -52,10 +54,11 @@ final class SectionBaker {
 	private final VoxelLighting vl;
 	private BufferBuilder builder;
 
-	/** Per-bake cache: fixed-point corner position (x4) -> traced light. */
+	/** Per-bake cache: fixed-point corner position (1/16-block units) -> traced light. */
 	private final Long2ObjectOpenHashMap<Vert> vcache = new Long2ObjectOpenHashMap<>();
 
 	private int[] qPos = new int[16384];
+	private int[] qSub = new int[16384];
 	private int[] qCol = new int[16384 * 4]; // 4 vertex colours per quad
 	private int quads;
 
@@ -68,10 +71,15 @@ final class SectionBaker {
 	private final float[] bestStr = new float[8];
 	private final int[] bestIdx = new int[8];
 
-	// Scratch while baking one section
+	// Scratch while baking one section / one face
 	private VtConfig cfg;
 	private boolean sunOn, lightOn;
 	private float strength, lx, ly, lz;
+	private int minSub;
+	// Face-local quadtree state
+	private int fKx0, fKy0, fKz0;
+	private int fUx, fUy, fUz, fVx, fVy, fVz;
+	private float fDot;
 
 	/** Traced light of one corner vertex. A -1 sentinel on sunR / bR means "not computed yet". */
 	private static final class Vert {
@@ -84,9 +92,9 @@ final class SectionBaker {
 		this.vl = vl;
 	}
 
-	/** Fixed-point corner position (1/4-block units), packed like BlockPos.asLong. */
+	/** Fixed-point corner position (1/16-block units). No practical collisions within a loaded area. */
 	private static long vkey(int x, int y, int z) {
-		return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | (long) (y & 0xFFF);
+		return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFF) << 16) | (long) (y & 0xFFFF);
 	}
 
 	private Vert vertex(int x, int y, int z) {
@@ -127,6 +135,7 @@ final class SectionBaker {
 		this.lx = vl.lx;
 		this.ly = vl.ly;
 		this.lz = vl.lz;
+		this.minSub = cfg.crispShadows ? 1 : 2;
 
 		final int minY = vl.level.getMinBuildHeight(), maxY = vl.level.getMaxBuildHeight();
 		final int bx = s.sx << 4, by = s.sy << 4, bz = s.sz << 4;
@@ -161,42 +170,57 @@ final class SectionBaker {
 		upload(s);
 	}
 
-	/** Emits the SUB x SUB sub-quads of one exposed block face at world block position (ox,oy,oz). */
+	/** Sets up face-local quadtree state and refines the whole 16x16 grid. */
 	private void emitFace(int ox, int oy, int oz, int d, int basePos) {
 		int[] O = FACE[d][0];
 		int[] F1 = FACE[d][1], F3 = FACE[d][3];
-		int ux = F1[0] - O[0], uy = F1[1] - O[1], uz = F1[2] - O[2];
-		int vx = F3[0] - O[0], vy = F3[1] - O[1], vz = F3[2] - O[2];
-		// Face origin in 1/4-block fixed point
-		int kx0 = (ox << 2) + (O[0] << 2);
-		int ky0 = (oy << 2) + (O[1] << 2);
-		int kz0 = (oz << 2) + (O[2] << 2);
-		float dot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
-
-		for (int si = 0; si < SUB * SUB; si++) {
-			int i = si & (SUB - 1), j = si / SUB;
-			int iu = i * ux, iuy = i * uy, iuz = i * uz;
-			int jv = j * vx, jvy = j * vy, jvz = j * vz;
-			int c0 = cornerLight(kx0 + iu + jv, ky0 + iuy + jvy, kz0 + iuz + jvz, dot);
-			int c1 = cornerLight(kx0 + iu + ux + jv, ky0 + iuy + uy + jvy, kz0 + iuz + uz + jvz, dot);
-			int c2 = cornerLight(kx0 + iu + ux + jv + vx, ky0 + iuy + uy + jvy + vy, kz0 + iuz + uz + jvz + vz, dot);
-			int c3 = cornerLight(kx0 + iu + jv + vx, ky0 + iuy + jvy + vy, kz0 + iuz + jvz + vz, dot);
-			if ((c0 | c1 | c2 | c3) == 0) continue;
-			addQuad(basePos | (si << 15), c0, c1, c2, c3);
-		}
+		fUx = F1[0] - O[0];
+		fUy = F1[1] - O[1];
+		fUz = F1[2] - O[2];
+		fVx = F3[0] - O[0];
+		fVy = F3[1] - O[1];
+		fVz = F3[2] - O[2];
+		fKx0 = ((ox + O[0]) << 4);
+		fKy0 = ((oy + O[1]) << 4);
+		fKz0 = ((oz + O[2]) << 4);
+		fDot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
+		emitRegion(basePos, 0, 0, RES);
 	}
 
 	/**
-	 * Traces sun + block light for one corner (fixed-point 1/4-block coords) and returns the
+	 * Quadtree over the face's 16x16 texel grid: (u,v) = origin in texels, s = region size.
+	 * Regions whose four corners trace to the same colour merge into one quad; anything that
+	 * differs keeps subdividing down to single texels.
+	 */
+	private void emitRegion(int basePos, int u, int v, int s) {
+		int c00 = cornerLight(fKx0 + u * fUx + v * fVx, fKy0 + u * fUy + v * fVy, fKz0 + u * fUz + v * fVz);
+		int c10 = cornerLight(fKx0 + (u + s) * fUx + v * fVx, fKy0 + (u + s) * fUy + v * fVy, fKz0 + (u + s) * fUz + v * fVz);
+		int c11 = cornerLight(fKx0 + (u + s) * fUx + (v + s) * fVx, fKy0 + (u + s) * fUy + (v + s) * fVy, fKz0 + (u + s) * fUz + (v + s) * fVz);
+		int c01 = cornerLight(fKx0 + u * fUx + (v + s) * fVx, fKy0 + u * fUy + (v + s) * fVy, fKz0 + u * fUz + (v + s) * fVz);
+
+		if (s <= minSub || (c00 == c10 && c10 == c11 && c11 == c01)) {
+			if ((c00 | c10 | c11 | c01) != 0)
+				addQuad(basePos, u | (v << 5) | (s << 10), c00, c10, c11, c01);
+			return;
+		}
+		int h = s >> 1;
+		emitRegion(basePos, u, v, h);
+		emitRegion(basePos, u + h, v, h);
+		emitRegion(basePos, u + h, v + h, h);
+		emitRegion(basePos, u, v + h, h);
+	}
+
+	/**
+	 * Traces sun + block light for one corner (fixed-point 1/16-block coords) and returns the
 	 * packed ARGB overlay colour, or 0 when nothing is visible.
 	 */
-	private int cornerLight(int kx, int ky, int kz, float dot) {
-		float wx = kx * SUBF, wy = ky * SUBF, wz = kz * SUBF;
+	private int cornerLight(int kx, int ky, int kz) {
+		float wx = kx * RESF, wy = ky * RESF, wz = kz * RESF;
 
 		// ---- sun (per channel)
 		float sr = 0f, sg = 0f, sb = 0f;
 		if (sunOn) {
-			if (dot <= 0f) {
+			if (fDot <= 0f) {
 				sr = sg = sb = cfg.selfShade;
 			} else {
 				Vert vt = vertex(kx, ky, kz);
@@ -348,12 +372,14 @@ final class SectionBaker {
 
 	// ------------------------------------------------------------------ mesh
 
-	private void addQuad(int pos, int c0, int c1, int c2, int c3) {
+	private void addQuad(int pos, int sub, int c0, int c1, int c2, int c3) {
 		if (quads == qPos.length) {
 			qPos = Arrays.copyOf(qPos, quads * 2);
+			qSub = Arrays.copyOf(qSub, quads * 2);
 			qCol = Arrays.copyOf(qCol, quads * 8);
 		}
 		qPos[quads] = pos;
+		qSub[quads] = sub;
 		qCol[quads * 4] = c0;
 		qCol[quads * 4 + 1] = c1;
 		qCol[quads * 4 + 2] = c2;
@@ -370,19 +396,20 @@ final class SectionBaker {
 		builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
 		for (int q = 0; q < quads; q++) {
 			int p = qPos[q];
-			int x = p & 15, y = (p >> 4) & 15, z = (p >> 8) & 15, d = (p >> 12) & 7, si = (p >> 15) & 15;
-			int i = si & (SUB - 1), j = si / SUB;
+			int x = p & 15, y = (p >> 4) & 15, z = (p >> 8) & 15, d = (p >> 12) & 7;
+			int sub = qSub[q];
+			int u = sub & 31, v = (sub >> 5) & 31, sz = (sub >> 10) & 63;
 			int[] O = FACE[d][0];
 			int[] F1 = FACE[d][1], F3 = FACE[d][3];
 			int ux = F1[0] - O[0], uy = F1[1] - O[1], uz = F1[2] - O[2];
 			int vx = F3[0] - O[0], vy = F3[1] - O[1], vz = F3[2] - O[2];
 			float ox = DX[d] * EPS, oy = DY[d] * EPS, oz = DZ[d] * EPS;
-			for (int v = 0; v < 4; v++) {
-				float fu = (i + UC[v]) * SUBF, fv = (j + VC[v]) * SUBF;
+			for (int k = 0; k < 4; k++) {
+				float fu = (u + UC[k] * sz) * RESF, fv = (v + VC[k] * sz) * RESF;
 				float px = x + O[0] + fu * ux + fv * vx;
 				float py = y + O[1] + fu * uy + fv * vy;
 				float pz = z + O[2] + fu * uz + fv * vz;
-				int c = qCol[q * 4 + v];
+				int c = qCol[q * 4 + k];
 				int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >>> 24) & 255;
 				builder.vertex(px + ox, py + oy, pz + oz)
 						.color(r, g, b, a)
