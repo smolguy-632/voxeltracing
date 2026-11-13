@@ -246,7 +246,7 @@ final class VoxelSection {
 									mk.add(m);
 									pt[bi] = (byte) type;
 									pm[bi] = (byte) mk.size();
-									if (type == T_PARTIAL_GLASS) {
+									if (type == T_GLASS) {
 										if (pi == null) pi = new byte[4096];
 										pi[bi] = (byte) glassIndex(st);
 									}
@@ -322,8 +322,10 @@ final class VoxelSection {
 		// ---- partial block: walk the 16x16x16 grid inside this block
 		long[] mask = masks.get((pmask[bi] & 255) - 1);
 		boolean solid = type == T_PARTIAL_SOLID;
-		boolean foliagePart = type == T_PARTIAL_FOLIAGE;
-		float[] ts = type == T_PARTIAL_GLASS && ptint != null ? TINT_SUB[ptint[bi] & 255] : null;
+		boolean foliagePart = type == T_FOLIAGE;
+		// T_GLASS in ptype means a partial glass block; fall back to clear glass if the
+		// tint index is somehow missing instead of crashing.
+		float[] ts = TINT_SUB[type == T_GLASS && ptint != null ? (ptint[bi] & 255) : GLASS_CLEAR];
 
 		final double inf = Double.POSITIVE_INFINITY;
 		// entry point in sub-voxel units [0,16)
