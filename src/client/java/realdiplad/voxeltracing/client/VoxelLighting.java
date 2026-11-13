@@ -28,6 +28,7 @@ public final class VoxelLighting {
 	public static final VoxelLighting INSTANCE = new VoxelLighting();
 
 	static final int NO_SUN = -1;
+	static final int NO_TARGET = Integer.MIN_VALUE;
 
 	final Long2ObjectOpenHashMap<VoxelSection> sections = new Long2ObjectOpenHashMap<>();
 	ClientLevel level;
