@@ -42,4 +42,3 @@ replay_*.log
 # source drops and packaged artifacts
 
 *.zip
-release.bat.bak

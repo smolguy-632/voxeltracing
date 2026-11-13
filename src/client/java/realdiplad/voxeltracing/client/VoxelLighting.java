@@ -43,10 +43,6 @@ public final class VoxelLighting {
 	private int queueHead;
 	private boolean needsScan = true;
 
-	// Result of the last trace(): the voxel that blocked it (first opaque one, else first foliage one)
-	boolean hitAny, hitOpaque;
-	int hitX, hitY, hitZ;
-
 	// One-entry section cache for the ray marcher
 	private VoxelSection cacheSec;
 	private int cSx, cSy, cSz;
@@ -310,8 +306,6 @@ public final class VoxelLighting {
 
 		final int minY = level.getMinBuildHeight(), maxY = level.getMaxBuildHeight();
 		float t = 1f;
-		hitAny = false;
-		hitOpaque = false;
 		while (true) {
 			double tn;
 			if (tMaxX < tMaxY) {
@@ -338,23 +332,8 @@ public final class VoxelLighting {
 			if (x == tx && y == ty && z == tz) return t;
 			float tr = transmittance(x, y, z);
 			if (tr < 1f) {
-				if (!hitAny || (tr == 0f && !hitOpaque)) {
-					hitAny = true;
-					hitOpaque = tr == 0f;
-					hitX = x;
-					hitY = y;
-					hitZ = z;
-				}
 				t *= tr;
-				if (t < 0.06f) {
-					if (!hitOpaque) {
-						hitOpaque = true;
-						hitX = x;
-						hitY = y;
-						hitZ = z;
-					}
-					return 0f;
-				}
+				if (t < 0.06f) return 0f;
 			}
 		}
 	}

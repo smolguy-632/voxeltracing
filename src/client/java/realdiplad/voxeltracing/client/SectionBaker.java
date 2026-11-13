@@ -2,27 +2,27 @@ package realdiplad.voxeltracing.client;
 
 import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
 import java.util.Arrays;
-import java.util.HashMap;
 
 /**
- * Turns one VoxelSection into overlay meshes.
+ * Turns one VoxelSection into an overlay mesh.
  *
- * Per exposed face we decide shading with voxel rays (sun + nearby emitters), as before.
- * Faces whose sun ray is hard-blocked by an opaque voxel are routed to a "trapezoid" pass:
- * the blocker's cube is projected onto the face's plane along the sun direction, the projection
- * is clipped to the merged rectangle of shadowed faces, and the result is fan-triangulated.
- * Each face belongs to exactly one pass, so shadow polygons never overlap and need no stencil.
+ * Lighting is evaluated per corner vertex, not per face: for every exposed face of every opaque
+ * block, a voxel-ray is traced from each of the four corner positions (exact world-space block
+ * corners) to the sun, and to the nearby emitters. Corner positions are shared by neighbouring
+ * faces and blocks, so the results are memoised in a hashmap keyed by the packed corner position
+ * for the duration of one section bake - every unique corner is traced exactly once and the cost
+ * stays comparable to the old per-voxel memo while faces meet in smooth gradients.
+ * Faces that end up visibly shadowed / lit become one translucent quad with per-vertex colour;
+ * everything else emits nothing.
  */
 final class SectionBaker {
 	private static final float EPS = 0.003f;
 	private static final int MAX_CAND = 128;
-	private static final int MAX_BLK = 256;
-	private static final int MEMO_DIM = 18;
-	private static final int MEMO_SIZE = MEMO_DIM * MEMO_DIM * MEMO_DIM;
-	private static final float Q_A = 14f, Q_W = 5f;
 
 	// Face order: DOWN, UP, NORTH(-Z), SOUTH(+Z), WEST(-X), EAST(+X)
 	private static final int[] DX = {0, 0, 0, 0, -1, 1};
@@ -37,58 +37,53 @@ final class SectionBaker {
 		{{0, 0, 0}, {0, 0, 1}, {0, 1, 1}, {0, 1, 0}},
 		{{1, 0, 1}, {1, 0, 0}, {1, 1, 0}, {1, 1, 1}},
 	};
-	// Per face: in-plane axes u, v and normal axis n (0=x, 1=y, 2=z)
-	private static final int[] UA = {0, 0, 0, 0, 2, 2};
-	private static final int[] VA = {2, 2, 1, 1, 1, 1};
-	private static final int[] NA = {1, 1, 2, 2, 0, 0};
 
+	// Warm light colour
 	private static final int WR = 255, WG = 176, WB = 96;
 
 	private final VoxelLighting vl;
 	private BufferBuilder builder;
-	private final int[] base = new int[3];
 
-	private final float[] sunMemo = new float[MEMO_SIZE];
-	private final float[] bMemo = new float[MEMO_SIZE];
-	private final float[] pMemo = new float[MEMO_SIZE];
-	private final int[] sunBlk = new int[MEMO_SIZE];
+	/** Per-bake cache: packed corner position -> traced light. Corners are shared, trace once. */
+	private final Long2ObjectOpenHashMap<Vert> vcache = new Long2ObjectOpenHashMap<>();
 
-	// Shade cells (rectangles) and sun-trapezoid cells, one grid each, so each face is in exactly one.
-	private final int[] grid = new int[6 * 16 * 16 * 16];
-	private final int[] layerCount = new int[6 * 16];
-	private final int[] tGrid = new int[6 * 16 * 16 * 16];
-	private final int[] tBlk = new int[6 * 16 * 16 * 16];
-	private final int[] tLayerCount = new int[6 * 16];
-
-	// Merged output rectangles: pos packs u | v<<4 | (w-1)<<8 | (h-1)<<12 | layer<<16 | d<<20
-	private int[] qPos = new int[2048];
-	private int[] qCol = new int[2048];
+	private int[] qPos = new int[8192];
+	private int[] qCol = new int[8192 * 4]; // 4 vertex colours per quad
 	private int quads;
-	private int[] tPos = new int[512];
-	private int[] tCol = new int[512];
-	private int[] tOwner = new int[512];
-	private int trapRects;
-
-	// Blockers that cast hard sun shadows in this section
-	private final HashMap<Long, Integer> blkMap = new HashMap<>();
-	private final int[] blkX = new int[MAX_BLK], blkY = new int[MAX_BLK], blkZ = new int[MAX_BLK];
-	private int blkCount;
-
-	// Triangle output for the trapezoid pass
-	private float[] triV = new float[9 * 1024];
-	private int[] triC = new int[3 * 1024];
-	private int triN;
 
 	// Emitter candidates for the section being baked
 	private final float[] cx = new float[MAX_CAND], cy = new float[MAX_CAND], cz = new float[MAX_CAND], cl = new float[MAX_CAND];
 	private final int[] cbx = new int[MAX_CAND], cby = new int[MAX_CAND], cbz = new int[MAX_CAND];
 	private int candCount;
 
+	// Small top-K scratch
 	private final float[] bestStr = new float[8];
 	private final int[] bestIdx = new int[8];
 
+	/** Traced light of one corner vertex. -1 means "not computed yet". */
+	private static final class Vert {
+		float sunT = -1f; // transmittance towards the sun
+		float b = -1f;    // torch light that actually arrives
+		float p;          // torch light that would arrive with no blockers
+	}
+
 	SectionBaker(VoxelLighting vl) {
 		this.vl = vl;
+	}
+
+	/** BlockPos.asLong layout: 26 bits x, 12 bits y, 26 bits z. */
+	private static long vkey(int x, int y, int z) {
+		return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | (long) (y & 0xFFF);
+	}
+
+	private Vert vertex(int x, int y, int z) {
+		long k = vkey(x, y, z);
+		Vert v = vcache.get(k);
+		if (v == null) {
+			v = new Vert();
+			vcache.put(k, v);
+		}
+		return v;
 	}
 
 	void bake(VoxelSection s, VtConfig cfg) {
@@ -110,30 +105,16 @@ final class SectionBaker {
 			return;
 		}
 
-		base[0] = s.sx << 4;
-		base[1] = s.sy << 4;
-		base[2] = s.sz << 4;
-
-		Arrays.fill(sunMemo, -1f);
-		Arrays.fill(bMemo, -1f);
-		Arrays.fill(sunBlk, -1);
-		Arrays.fill(grid, 0);
-		Arrays.fill(layerCount, 0);
-		Arrays.fill(tGrid, 0);
-		Arrays.fill(tBlk, 0);
-		Arrays.fill(tLayerCount, 0);
-		quads = 0;
-		trapRects = 0;
-		blkCount = 0;
-		blkMap.clear();
+		vcache.clear();
 
 		final float strength = vl.sunStrength;
 		final float lx = vl.lx, ly = vl.ly, lz = vl.lz;
 		final float range = cfg.quality.rayRange;
 		final int minY = vl.level.getMinBuildHeight(), maxY = vl.level.getMaxBuildHeight();
-		final int bx = base[0], by = base[1], bz = base[2];
+		final int bx = s.sx << 4, by = s.sy << 4, bz = s.sz << 4;
 		final long[] op = s.opaque;
 
+		quads = 0;
 		for (int w = 0; w < 64; w++) {
 			long bits = op[w];
 			while (bits != 0L) {
@@ -149,90 +130,72 @@ final class SectionBaker {
 					boolean inside = nx >= 0 && nx < 16 && ny >= 0 && ny < 16 && nz >= 0 && nz < 16;
 					if (inside) {
 						int ni = (ny << 8) | (nz << 4) | nx;
-						if ((op[ni >>> 6] & (1L << ni)) != 0L) continue;
+						if ((op[ni >>> 6] & (1L << ni)) != 0L) continue;   // face buried against another solid
 					} else if (vl.isOpaque(bx + nx, wy, bz + nz)) {
 						continue;
 					}
 
-					int wx = bx + nx, wz = bz + nz;
-					int mi = (nx + 1) + MEMO_DIM * ((ny + 1) + MEMO_DIM * (nz + 1));
+					// ---- light the four corner vertices (shared corners come from the cache)
+					float dot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
+					int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+					float maxSum = 0f;
+					for (int v = 0; v < 4; v++) {
+						int vx = bx + x + FACE[d][v][0];
+						int vy = by + y + FACE[d][v][1];
+						int vz = bz + z + FACE[d][v][2];
 
-					// ---- sun
-					float sunA = 0f;
-					boolean hard = false;
-					if (sunOn) {
-						float dot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
-						if (dot <= 0f) {
-							sunA = cfg.selfShade;
-						} else {
-							float t = sunMemo[mi];
-							if (t < 0f) {
-								t = vl.trace(wx + 0.5, wy + 0.5, wz + 0.5, lx, ly, lz, range,
-									VoxelLighting.NO_TARGET, 0, 0);
-								sunMemo[mi] = t;
-								if (t == 0f && vl.hitAny) sunBlk[mi] = registerBlocker(vl.hitX, vl.hitY, vl.hitZ);
+						// ---- sun (per vertex)
+						float sunA = 0f;
+						if (sunOn) {
+							if (dot <= 0f) {
+								sunA = cfg.selfShade;
+							} else {
+								Vert vt = vertex(vx, vy, vz);
+								if (vt.sunT < 0f) {
+									vt.sunT = vl.trace(vx, vy, vz, lx, ly, lz, range,
+										VoxelLighting.NO_TARGET, 0, 0);
+								}
+								sunA = (1f - vt.sunT) * cfg.shadowStrength;
 							}
-							hard = t == 0f && sunBlk[mi] >= 0;
-							sunA = (1f - t) * cfg.shadowStrength;
+							sunA *= strength;
 						}
-						sunA *= strength;
-					}
 
-					// ---- block light
-					float b = 0f, p = 0f;
-					if (lightOn) {
-						b = bMemo[mi];
-						if (b < 0f) {
-							lightVoxel(wx, wy, wz, mi, cfg);
-							b = bMemo[mi];
+						// ---- block light (per vertex)
+						float b = 0f, p = 0f;
+						if (lightOn) {
+							Vert vt = vertex(vx, vy, vz);
+							if (vt.b < 0f) vertexLight(vx, vy, vz, vt, cfg);
+							b = vt.b;
+							p = vt.p;
 						}
-						p = pMemo[mi];
+
+						float dark = 1f - (1f - sunA * (1f - b)) * (1f - (p - b) * cfg.torchShadow);
+						float warm = b * cfg.warmStrength;
+						float sum = dark + warm;
+						if (sum > maxSum) maxSum = sum;
+
+						int col = 0;
+						if (sum >= 0.02f) {
+							float a = Math.min(0.8f, sum);
+							float wgt = warm / sum;
+							col = ((int) (WR * wgt))
+								| ((int) (WG * wgt) << 8)
+								| ((int) (WB * wgt) << 16)
+								| ((int) (a * 255f) << 24);
+						}
+						if (v == 0) c0 = col;
+						else if (v == 1) c1 = col;
+						else if (v == 2) c2 = col;
+						else c3 = col;
 					}
+					if (maxSum < 0.02f) continue;
 
-					float dark = 1f - (1f - sunA * (1f - b)) * (1f - (p - b) * cfg.torchShadow);
-					float warm = b * cfg.warmStrength;
-					float sum = dark + warm;
-					if (sum < 0.02f) continue;
-
-					int qa = (int) (Math.min(0.8f, sum) * Q_A + 0.5f);
-					if (qa == 0) continue;
-					int qw = (int) (warm / sum * Q_W + 0.5f);
-					int layer, u, v;
-					if (d < 2) { layer = y; u = x; v = z; }
-					else if (d < 4) { layer = z; u = x; v = y; }
-					else { layer = x; u = z; v = y; }
-
-					int cell = (((d << 4) + layer) << 8) + (v << 4) + u;
-					int val = 0x100 | (qa << 4) | qw;
-					if (hard) {
-						tGrid[cell] = val;
-						tBlk[cell] = sunBlk[mi];
-						tLayerCount[(d << 4) + layer]++;
-					} else {
-						grid[cell] = val;
-						layerCount[(d << 4) + layer]++;
-					}
+					addQuad(x | (y << 4) | (z << 8) | (d << 12), c0, c1, c2, c3);
 				}
 			}
 		}
 
-		mergeGrid(grid, null, layerCount, false);
-		mergeGrid(tGrid, tBlk, tLayerCount, true);
 		upload(s);
-	}
-
-	// ------------------------------------------------------------------ blockers
-
-	private int registerBlocker(int hx, int hy, int hz) {
-		long key = ((long) (hx + 0x800000) << 40) | ((long) (hy + 0x800) << 24) | (long) (hz + 0x800000);
-		Integer found = blkMap.get(key);
-		if (found != null) return found;
-		if (blkCount >= MAX_BLK) return -1;
-		blkMap.put(key, blkCount);
-		blkX[blkCount] = hx;
-		blkY[blkCount] = hy;
-		blkZ[blkCount] = hz;
-		return blkCount++;
 	}
 
 	// ------------------------------------------------------------------ light
@@ -272,8 +235,9 @@ final class SectionBaker {
 		}
 	}
 
-	private void lightVoxel(int wx, int wy, int wz, int mi, VtConfig cfg) {
-		final float ox = wx + 0.5f, oy = wy + 0.5f, oz = wz + 0.5f;
+	/** Traces the nearby emitters from one corner vertex; fills v.b (arrives) and v.p (no blockers). */
+	private void vertexLight(int wx, int wy, int wz, Vert v, VtConfig cfg) {
+		final float ox = wx, oy = wy, oz = wz;
 		final int kmax = Math.min(cfg.quality.lightRays, 8);
 		int k = 0;
 		for (int c = 0; c < candCount; c++) {
@@ -308,292 +272,50 @@ final class SectionBaker {
 			keepP *= 1f - str;
 			keepB *= 1f - str * t;
 		}
-		bMemo[mi] = 1f - keepB;
-		pMemo[mi] = 1f - keepP;
+		v.b = 1f - keepB;
+		v.p = 1f - keepP;
 	}
 
-	// ------------------------------------------------------------------ greedy merge
+	// ------------------------------------------------------------------ mesh
 
-	private static boolean same(int[] g, int[] bl, int i, int val, int owner) {
-		return g[i] == val && (bl == null || bl[i] == owner);
-	}
-
-	private void mergeGrid(int[] g, int[] bl, int[] layers, boolean trap) {
-		for (int d = 0; d < 6; d++) {
-			for (int layer = 0; layer < 16; layer++) {
-				if (layers[(d << 4) + layer] == 0) continue;
-				int base = ((d << 4) + layer) << 8;
-				for (int v = 0; v < 16; v++) {
-					for (int u = 0; u < 16; u++) {
-						int i0 = base + (v << 4) + u;
-						int val = g[i0];
-						if (val == 0) continue;
-						int owner = bl == null ? 0 : bl[i0];
-						int w = 1;
-						while (u + w < 16 && same(g, bl, i0 + w, val, owner)) w++;
-						int h = 1;
-						grow:
-						while (v + h < 16) {
-							for (int k = 0; k < w; k++) {
-								if (!same(g, bl, base + ((v + h) << 4) + u + k, val, owner)) break grow;
-							}
-							h++;
-						}
-						for (int dv = 0; dv < h; dv++) {
-							for (int k = 0; k < w; k++) g[base + ((v + dv) << 4) + u + k] = 0;
-						}
-						int pos = u | (v << 4) | ((w - 1) << 8) | ((h - 1) << 12) | (layer << 16) | (d << 20);
-						if (trap) addTrap(pos, val, owner);
-						else addRect(pos, val);
-					}
-				}
-			}
-		}
-	}
-
-	private void addRect(int pos, int val) {
+	private void addQuad(int pos, int c0, int c1, int c2, int c3) {
 		if (quads == qPos.length) {
 			qPos = Arrays.copyOf(qPos, quads * 2);
-			qCol = Arrays.copyOf(qCol, quads * 2);
+			qCol = Arrays.copyOf(qCol, quads * 8);
 		}
 		qPos[quads] = pos;
-		qCol[quads] = val;
+		qCol[quads * 4] = c0;
+		qCol[quads * 4 + 1] = c1;
+		qCol[quads * 4 + 2] = c2;
+		qCol[quads * 4 + 3] = c3;
 		quads++;
 	}
 
-	private void addTrap(int pos, int val, int owner) {
-		if (trapRects == tPos.length) {
-			int n = trapRects * 2;
-			tPos = Arrays.copyOf(tPos, n);
-			tCol = Arrays.copyOf(tCol, n);
-			tOwner = Arrays.copyOf(tOwner, n);
-		}
-		tPos[trapRects] = pos;
-		tCol[trapRects] = val;
-		tOwner[trapRects] = owner;
-		trapRects++;
-	}
-
-	// ------------------------------------------------------------------ trapezoid projection
-
-	/** Projects blocker cube onto the face plane along the sun, clips to the rectangle, fan-triangulates. */
-	private void emitTrap(int pos, int val, int owner) {
-		int u = pos & 15, v = (pos >> 4) & 15;
-		int w = ((pos >> 8) & 15) + 1, h = ((pos >> 12) & 15) + 1;
-		int layer = (pos >> 16) & 15, d = (pos >> 20) & 7;
-		int nA = NA[d], uA = UA[d], vA = VA[d];
-		double sgn = (d & 1) == 1 ? 1.0 : -1.0;
-		double c = layer + (sgn > 0 ? 1 : 0);                 // plane coordinate, section-local
-		double[] L = {vl.lx, vl.ly, vl.lz};
-		double nL = sgn * L[nA];
-		if (nL <= 1e-4) return;
-
-		// blocker cube corners in section-local space
-		double bx = blkX[owner] - base[0], by = blkY[owner] - base[1], bz = blkZ[owner] - base[2];
-		double[][] P = new double[8][];
-		for (int i = 0; i < 8; i++) {
-			P[i] = new double[] {bx + ((i >> 2) & 1), by + ((i >> 1) & 1), bz + (i & 1)};
-		}
-		double[] S = new double[8];
-		for (int i = 0; i < 8; i++) S[i] = sgn * (P[i][nA] - c);
-
-		// candidate points on the lit side of the plane: projected corners + plane crossings
-		double[] cu = new double[24], cv = new double[24];
-		int n = 0;
-		for (int i = 0; i < 8; i++) {
-			if (S[i] < 0) continue;
-			double t = S[i] / nL;
-			cu[n] = P[i][uA] - t * L[uA];
-			cv[n] = P[i][vA] - t * L[vA];
-			n++;
-		}
-		for (int i = 0; i < 8; i++) {
-			for (int j = i + 1; j < 8; j++) {
-				if (Integer.bitCount(i ^ j) != 1) continue;
-				if (!((S[i] > 0 && S[j] < 0) || (S[i] < 0 && S[j] > 0))) continue;
-				double f = S[i] / (S[i] - S[j]);
-				cu[n] = P[i][uA] + f * (P[j][uA] - P[i][uA]);
-				cv[n] = P[i][vA] + f * (P[j][vA] - P[i][vA]);
-				n++;
-			}
-		}
-		if (n < 3) return;
-
-		double[][] hull = convexHull(cu, cv, n);
-		if (hull == null) return;
-
-		// clip to the rectangle of shadowed faces on this plane
-		double[][] poly = clipAxis(hull, 0, u, true);
-		poly = clipAxis(poly, 0, u + w, false);
-		poly = clipAxis(poly, 1, v, true);
-		poly = clipAxis(poly, 1, v + h, false);
-		if (poly.length < 3) return;
-
-		// fan-triangulate, orient each triangle outward, emit
-		for (int k = 1; k < poly.length - 1; k++) {
-			double[] a = toVec(poly[0], uA, vA, nA, c, sgn);
-			double[] b = toVec(poly[k], uA, vA, nA, c, sgn);
-			double[] e = toVec(poly[k + 1], uA, vA, nA, c, sgn);
-			double ex = b[0] - a[0], ey = b[1] - a[1], ez = b[2] - a[2];
-			double fx = e[0] - a[0], fy = e[1] - a[1], fz = e[2] - a[2];
-			double nx = ey * fz - ez * fy, ny = ez * fx - ex * fz, nz = ex * fy - ey * fx;
-			double along = (nA == 0 ? nx : nA == 1 ? ny : nz) * sgn;
-			double mag = Math.abs(nx) + Math.abs(ny) + Math.abs(nz);
-			if (mag < 1e-9) continue;               // zero-area sliver
-			if (along < 0) {
-				double[] tmp = b;
-				b = e;
-				e = tmp;
-			}
-			addTri(a, b, e, val);
-		}
-	}
-
-	private static double[] toVec(double[] p, int uA, int vA, int nA, double c, double sgn) {
-		double[] r = new double[3];
-		r[uA] = p[0];
-		r[vA] = p[1];
-		r[nA] = c + sgn * EPS;
-		return r;
-	}
-
-	private static double[][] clipAxis(double[][] poly, int ax, double k, boolean keepGe) {
-		int m = poly.length;
-		if (m == 0) return poly;
-		double[][] out = new double[m * 2][];
-		int n = 0;
-		for (int i = 0; i < m; i++) {
-			double[] a = poly[i], b = poly[(i + 1) % m];
-			boolean ia = keepGe ? a[ax] >= k : a[ax] <= k;
-			boolean ib = keepGe ? b[ax] >= k : b[ax] <= k;
-			if (ia) out[n++] = a;
-			if (ia != ib) {
-				double t = (k - a[ax]) / (b[ax] - a[ax]);
-				out[n++] = new double[] {a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])};
-			}
-		}
-		return Arrays.copyOf(out, n);
-	}
-
-	/** Monotone-chain convex hull. Returns CCW points, or null if fewer than 3. */
-	private static double[][] convexHull(double[] us, double[] vs, int n) {
-		double[][] pts = new double[n][];
-		for (int i = 0; i < n; i++) pts[i] = new double[] {us[i], vs[i]};
-		Arrays.sort(pts, (p, q) -> p[0] != q[0] ? Double.compare(p[0], q[0]) : Double.compare(p[1], q[1]));
-		double[][] h = new double[2 * n + 1][];
-		int k = 0;
-		for (int i = 0; i < n; i++) {
-			while (k >= 2 && cross(h[k - 2], h[k - 1], pts[i]) <= 0) k--;
-			h[k++] = pts[i];
-		}
-		for (int i = n - 2, t = k + 1; i >= 0; i--) {
-			while (k >= t && cross(h[k - 2], h[k - 1], pts[i]) <= 0) k--;
-			h[k++] = pts[i];
-		}
-		if (k < 4) return null;
-		return Arrays.copyOf(h, k - 1);
-	}
-
-	private static double cross(double[] o, double[] a, double[] b) {
-		return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-	}
-
-	private void addTri(double[] a, double[] b, double[] c, int val) {
-		if (triN * 3 + 3 > triC.length) {
-			triV = Arrays.copyOf(triV, triV.length * 2);
-			triC = Arrays.copyOf(triC, triC.length * 2);
-		}
-		int o = triN * 9;
-		triV[o] = (float) a[0]; triV[o + 1] = (float) a[1]; triV[o + 2] = (float) a[2];
-		triV[o + 3] = (float) b[0]; triV[o + 4] = (float) b[1]; triV[o + 5] = (float) b[2];
-		triV[o + 6] = (float) c[0]; triV[o + 7] = (float) c[1]; triV[o + 8] = (float) c[2];
-		triC[triN] = val;
-		triN++;
-	}
-
-	// ------------------------------------------------------------------ upload
-
 	private void upload(VoxelSection s) {
-		buildRects(s);
-		buildTraps(s);
-	}
-
-	private void buildRects(VoxelSection s) {
 		if (quads == 0) {
-			if (s.vb != null) {
-				s.vb.close();
-				s.vb = null;
-			}
-			s.quadCount = 0;
+			s.clearMesh();
 			return;
 		}
 		if (builder == null) builder = new BufferBuilder(1 << 16);
 		builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
 		for (int q = 0; q < quads; q++) {
 			int p = qPos[q];
-			int u = p & 15, v = (p >> 4) & 15;
-			int w = ((p >> 8) & 15) + 1, h = ((p >> 12) & 15) + 1;
-			int layer = (p >> 16) & 15, d = (p >> 20) & 7;
-			int val = qCol[q];
-			float wgt = (val & 15) / Q_W;
-			int r = (int) (WR * wgt), g = (int) (WG * wgt), b = (int) (WB * wgt);
-			int a = (int) (((val >> 4) & 15) / Q_A * 255f + 0.5f);
+			int x = p & 15, y = (p >> 4) & 15, z = (p >> 8) & 15, d = (p >> 12) & 7;
 			float ox = DX[d] * EPS, oy = DY[d] * EPS, oz = DZ[d] * EPS;
 			int[][] f = FACE[d];
-			for (int k = 0; k < 4; k++) {
-				float px, py, pz;
-				if (d < 2) {
-					px = u + f[k][0] * w;
-					pz = v + f[k][2] * h;
-					py = layer + f[k][1];
-				} else if (d < 4) {
-					px = u + f[k][0] * w;
-					py = v + f[k][1] * h;
-					pz = layer + f[k][2];
-				} else {
-					pz = u + f[k][2] * w;
-					py = v + f[k][1] * h;
-					px = layer + f[k][0];
-				}
-				builder.vertex(px + ox, py + oy, pz + oz).color(r, g, b, a).endVertex();
+			for (int v = 0; v < 4; v++) {
+				int c = qCol[q * 4 + v];
+				int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >>> 24) & 255;
+				builder.vertex(x + f[v][0] + ox, y + f[v][1] + oy, z + f[v][2] + oz)
+					.color(r, g, b, a)
+					.endVertex();
 			}
 		}
 		BufferBuilder.RenderedBuffer rb = builder.end();
-		if (s.vb == null) s.vb = new com.mojang.blaze3d.vertex.VertexBuffer(com.mojang.blaze3d.vertex.VertexBuffer.Usage.STATIC);
+		if (s.vb == null) s.vb = new VertexBuffer(VertexBuffer.Usage.STATIC);
 		s.vb.bind();
 		s.vb.upload(rb);
-		com.mojang.blaze3d.vertex.VertexBuffer.unbind();
+		VertexBuffer.unbind();
 		s.quadCount = quads;
-	}
-
-	private void buildTraps(VoxelSection s) {
-		triN = 0;
-		for (int i = 0; i < trapRects; i++) emitTrap(tPos[i], tCol[i], tOwner[i]);
-		if (triN == 0) {
-			if (s.vbSun != null) {
-				s.vbSun.close();
-				s.vbSun = null;
-			}
-			s.trapCount = 0;
-			return;
-		}
-		if (builder == null) builder = new BufferBuilder(1 << 16);
-		builder.begin(VertexFormat.Mode.TRIANGLES, DefaultVertexFormat.POSITION_COLOR);
-		for (int t = 0; t < triN; t++) {
-			int val = triC[t];
-			float wgt = (val & 15) / Q_W;
-			int r = (int) (WR * wgt), g = (int) (WG * wgt), b = (int) (WB * wgt);
-			int a = (int) (((val >> 4) & 15) / Q_A * 255f + 0.5f);
-			int o = t * 9;
-			for (int k = 0; k < 3; k++) {
-				builder.vertex(triV[o + k * 3], triV[o + k * 3 + 1], triV[o + k * 3 + 2]).color(r, g, b, a).endVertex();
-			}
-		}
-		BufferBuilder.RenderedBuffer rb = builder.end();
-		if (s.vbSun == null) s.vbSun = new com.mojang.blaze3d.vertex.VertexBuffer(com.mojang.blaze3d.vertex.VertexBuffer.Usage.STATIC);
-		s.vbSun.bind();
-		s.vbSun.upload(rb);
-		com.mojang.blaze3d.vertex.VertexBuffer.unbind();
-		s.trapCount = triN * 3;
 	}
 }
