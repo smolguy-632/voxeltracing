@@ -39,8 +39,10 @@ final class VoxelSection {
 	int bakedKey = Integer.MIN_VALUE;
 	int sortKey;
 
-	VertexBuffer vb;
+	VertexBuffer vb;       // per-face shade rectangles (QUADS)
+	VertexBuffer vbSun;    // projected sun-shadow trapezoids, fan-triangulated (TRIANGLES)
 	int quadCount;
+	int trapCount;         // vertex count of vbSun
 
 	VoxelSection(int sx, int sy, int sz) {
 		this.sx = sx;
@@ -136,7 +138,12 @@ final class VoxelSection {
 			vb.close();
 			vb = null;
 		}
+		if (vbSun != null) {
+			vbSun.close();
+			vbSun = null;
+		}
 		quadCount = 0;
+		trapCount = 0;
 	}
 
 	void close() {

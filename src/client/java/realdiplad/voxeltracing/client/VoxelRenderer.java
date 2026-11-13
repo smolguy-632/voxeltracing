@@ -46,14 +46,21 @@ final class VoxelRenderer {
 
 		boolean drewAny = false;
 		for (VoxelSection s : vl.sections.values()) {
-			if (s.vb == null || s.quadCount == 0) continue;
+			if (s.quadCount == 0 && s.trapCount == 0) continue;
 			double x0 = s.sx << 4, y0 = s.sy << 4, z0 = s.sz << 4;
 			if (frustum != null && !frustum.isVisible(new AABB(x0, y0, z0, x0 + 16, y0 + 16, z0 + 16))) continue;
 
 			MV.set(base).translate((float) (x0 - cam.x), (float) (y0 - cam.y), (float) (z0 - cam.z));
-			s.vb.bind();
-			s.vb.drawWithShader(MV, proj, shader);
-			drewAny = true;
+			if (s.vb != null && s.quadCount > 0) {
+				s.vb.bind();
+				s.vb.drawWithShader(MV, proj, shader);
+				drewAny = true;
+			}
+			if (s.vbSun != null && s.trapCount > 0) {
+				s.vbSun.bind();
+				s.vbSun.drawWithShader(MV, proj, shader);
+				drewAny = true;
+			}
 		}
 		if (drewAny) VertexBuffer.unbind();
 
