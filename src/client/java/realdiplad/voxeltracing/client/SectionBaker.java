@@ -5,36 +5,38 @@ import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import net.minecraft.util.Mth;
 
 import java.util.Arrays;
 
 /**
  * Turns one VoxelSection into an overlay mesh.
  *
- * Lighting is evaluated per corner vertex, not per face: for every exposed face of every opaque
- * block, a voxel-ray is traced from each of the four corner positions (exact world-space block
- * corners) to the sun, and to the nearby emitters. Corner positions are shared by neighbouring
- * faces and blocks, so the results are memoised in a hashmap keyed by the packed corner position
- * for the duration of one section bake - every unique corner is traced exactly once and the cost
- * stays comparable to the old per-voxel memo while faces meet in smooth gradients.
+ * Every exposed block face is split into a 4x4 grid of sub-quads (one sub-quad = 1/4 block =
+ * 4 texture pixels). Light is traced at each sub-quad corner: a ray towards the sun and rays to
+ * the nearby emitters. Corner results are memoised by exact world position (1/4-block fixed
+ * point), so corners shared by neighbouring sub-quads, faces and blocks are traced exactly once
+ * and neighbouring quads stay seam-free while shadow edges stay sharp at 1/4-block resolution.
  *
  * Rays resolve on the per-block 16x16x16 sub-voxel grid and carry an RGB transmittance, so
  * shadows from partial shapes (stairs, slabs, fences, panes...) are true to their silhouette
  * and stained glass tints both the sun shadows and the torch glow beneath it. The per-channel
  * darkness collapses into one translucent quad: channels that pass more light lift the overlay
  * colour, which reads as coloured light inside the shadow.
- * Faces that end up visibly shadowed / lit become one translucent quad with per-vertex colour;
- * everything else emits nothing.
  */
 final class SectionBaker {
 	private static final float EPS = 0.003f;
 	private static final int MAX_CAND = 128;
+	/** Sub-quads per block face axis (4x4 = 16 sub-quads of 1/4 block each). */
+	private static final int SUB = 4;
+	private static final float SUBF = 1f / SUB;
+	private static final int[] UC = {0, 1, 1, 0}, VC = {0, 0, 1, 1};
 
 	// Face order: DOWN, UP, NORTH(-Z), SOUTH(+Z), WEST(-X), EAST(+X)
 	private static final int[] DX = {0, 0, 0, 0, -1, 1};
 	private static final int[] DY = {-1, 1, 0, 0, 0, 0};
 	private static final int[] DZ = {0, 0, -1, 1, 0, 0};
-	/** Counter-clockwise (seen from outside) corner offsets of each face. */
+	/** Counter-clockwise (seen from outside) corner offsets of each face: O, O+U, O+U+V, O+V. */
 	private static final int[][][] FACE = {
 		{{0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}},
 		{{0, 1, 0}, {0, 1, 1}, {1, 1, 1}, {1, 1, 0}},
@@ -50,11 +52,11 @@ final class SectionBaker {
 	private final VoxelLighting vl;
 	private BufferBuilder builder;
 
-	/** Per-bake cache: packed corner position -> traced light. Corners are shared, trace once. */
+	/** Per-bake cache: fixed-point corner position (x4) -> traced light. */
 	private final Long2ObjectOpenHashMap<Vert> vcache = new Long2ObjectOpenHashMap<>();
 
-	private int[] qPos = new int[8192];
-	private int[] qCol = new int[8192 * 4]; // 4 vertex colours per quad
+	private int[] qPos = new int[16384];
+	private int[] qCol = new int[16384 * 4]; // 4 vertex colours per quad
 	private int quads;
 
 	// Emitter candidates for the section being baked
@@ -65,6 +67,11 @@ final class SectionBaker {
 	// Small top-K scratch
 	private final float[] bestStr = new float[8];
 	private final int[] bestIdx = new int[8];
+
+	// Scratch while baking one section
+	private VtConfig cfg;
+	private boolean sunOn, lightOn;
+	private float strength, lx, ly, lz;
 
 	/** Traced light of one corner vertex. A -1 sentinel on sunR / bR means "not computed yet". */
 	private static final class Vert {
@@ -77,7 +84,7 @@ final class SectionBaker {
 		this.vl = vl;
 	}
 
-	/** BlockPos.asLong layout: 26 bits x, 12 bits y, 26 bits z. */
+	/** Fixed-point corner position (1/4-block units), packed like BlockPos.asLong. */
 	private static long vkey(int x, int y, int z) {
 		return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | (long) (y & 0xFFF);
 	}
@@ -113,9 +120,14 @@ final class SectionBaker {
 
 		vcache.clear();
 
-		final float strength = vl.sunStrength;
-		final float lx = vl.lx, ly = vl.ly, lz = vl.lz;
-		final float range = cfg.quality.rayRange;
+		this.cfg = cfg;
+		this.sunOn = sunOn;
+		this.lightOn = lightOn;
+		this.strength = vl.sunStrength;
+		this.lx = vl.lx;
+		this.ly = vl.ly;
+		this.lz = vl.lz;
+
 		final int minY = vl.level.getMinBuildHeight(), maxY = vl.level.getMaxBuildHeight();
 		final int bx = s.sx << 4, by = s.sy << 4, bz = s.sz << 4;
 		final long[] op = s.opaque;
@@ -141,87 +153,98 @@ final class SectionBaker {
 						continue;
 					}
 
-					// ---- light the four corner vertices (shared corners come from the cache)
-					float dot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
-					int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-					float maxSum = 0f;
-					for (int v = 0; v < 4; v++) {
-						int vx = bx + x + FACE[d][v][0];
-						int vy = by + y + FACE[d][v][1];
-						int vz = bz + z + FACE[d][v][2];
-
-						// ---- sun (per vertex, per channel)
-						float sr = 0f, sg = 0f, sb = 0f;
-						if (sunOn) {
-							if (dot <= 0f) {
-								sr = sg = sb = cfg.selfShade;
-							} else {
-								Vert vt = vertex(vx, vy, vz);
-								if (vt.sunR < 0f) {
-									vl.trace(vx, vy, vz, lx, ly, lz, range,
-											VoxelLighting.NO_TARGET, 0, 0);
-									vt.sunR = vl.trR;
-									vt.sunG = vl.trG;
-									vt.sunB = vl.trB;
-								}
-								sr = (1f - vt.sunR) * cfg.shadowStrength;
-								sg = (1f - vt.sunG) * cfg.shadowStrength;
-								sb = (1f - vt.sunB) * cfg.shadowStrength;
-							}
-							sr *= strength;
-							sg *= strength;
-							sb *= strength;
-						}
-
-						// ---- block light (per vertex, per channel)
-						float br = 0f, bg = 0f, bb = 0f, p = 0f;
-						if (lightOn) {
-							Vert vt = vertex(vx, vy, vz);
-							if (vt.bR < 0f) vertexLight(vx, vy, vz, vt, cfg);
-							br = vt.bR;
-							bg = vt.bG;
-							bb = vt.bB;
-							p = vt.p;
-						}
-
-						// Per-channel darkness (sun occlusion + torch occlusion) and warm glow.
-						float dr = 1f - (1f - sr * (1f - br)) * (1f - (p - br) * cfg.torchShadow);
-						float dg = 1f - (1f - sg * (1f - bg)) * (1f - (p - bg) * cfg.torchShadow);
-						float db = 1f - (1f - sb * (1f - bb)) * (1f - (p - bb) * cfg.torchShadow);
-						float wr = br * cfg.warmStrength * WARMN[0];
-						float wg = bg * cfg.warmStrength * WARMN[1];
-						float wb = bb * cfg.warmStrength * WARMN[2];
-
-						float aD = Math.max(dr, Math.max(dg, db));
-						float a = Math.min(0.8f, aD + Math.max(wr, Math.max(wg, wb)));
-						float sum = aD + Math.max(wr, Math.max(wg, wb));
-						if (sum > maxSum) maxSum = sum;
-
-						int col = 0;
-						if (a >= 0.02f) {
-							// Channels that pass more light lift the overlay colour: that reads
-							// as coloured light inside the shadow. Warm glow adds its own tint.
-							float rr = clamp01((aD - dr) / a + wr / a);
-							float gr = clamp01((aD - dg) / a + wg / a);
-							float brr = clamp01((aD - db) / a + wb / a);
-							col = ((int) (rr * 255f))
-									| ((int) (gr * 255f) << 8)
-									| ((int) (brr * 255f) << 16)
-									| ((int) (a * 255f) << 24);
-						}
-						if (v == 0) c0 = col;
-						else if (v == 1) c1 = col;
-						else if (v == 2) c2 = col;
-						else c3 = col;
-					}
-					if (maxSum < 0.02f) continue;
-
-					addQuad(x | (y << 4) | (z << 8) | (d << 12), c0, c1, c2, c3);
+					emitFace(bx + x, by + y, bz + z, d, x | (y << 4) | (z << 8) | (d << 12));
 				}
 			}
 		}
 
 		upload(s);
+	}
+
+	/** Emits the SUB x SUB sub-quads of one exposed block face at world block position (ox,oy,oz). */
+	private void emitFace(int ox, int oy, int oz, int d, int basePos) {
+		int[] O = FACE[d][0];
+		int[] F1 = FACE[d][1], F3 = FACE[d][3];
+		int ux = F1[0] - O[0], uy = F1[1] - O[1], uz = F1[2] - O[2];
+		int vx = F3[0] - O[0], vy = F3[1] - O[1], vz = F3[2] - O[2];
+		// Face origin in 1/4-block fixed point
+		int kx0 = (ox << 2) + (O[0] << 2);
+		int ky0 = (oy << 2) + (O[1] << 2);
+		int kz0 = (oz << 2) + (O[2] << 2);
+		float dot = DX[d] * lx + DY[d] * ly + DZ[d] * lz;
+
+		for (int si = 0; si < SUB * SUB; si++) {
+			int i = si & (SUB - 1), j = si / SUB;
+			int iu = i * ux, iuy = i * uy, iuz = i * uz;
+			int jv = j * vx, jvy = j * vy, jvz = j * vz;
+			int c0 = cornerLight(kx0 + iu + jv, ky0 + iuy + jvy, kz0 + iuz + jvz, dot);
+			int c1 = cornerLight(kx0 + iu + ux + jv, ky0 + iuy + uy + jvy, kz0 + iuz + uz + jvz, dot);
+			int c2 = cornerLight(kx0 + iu + ux + jv + vx, ky0 + iuy + uy + jvy + vy, kz0 + iuz + uz + jvz + vz, dot);
+			int c3 = cornerLight(kx0 + iu + jv + vx, ky0 + iuy + jvy + vy, kz0 + iuz + jvz + vz, dot);
+			if ((c0 | c1 | c2 | c3) == 0) continue;
+			addQuad(basePos | (si << 15), c0, c1, c2, c3);
+		}
+	}
+
+	/**
+	 * Traces sun + block light for one corner (fixed-point 1/4-block coords) and returns the
+	 * packed ARGB overlay colour, or 0 when nothing is visible.
+	 */
+	private int cornerLight(int kx, int ky, int kz, float dot) {
+		float wx = kx * SUBF, wy = ky * SUBF, wz = kz * SUBF;
+
+		// ---- sun (per channel)
+		float sr = 0f, sg = 0f, sb = 0f;
+		if (sunOn) {
+			if (dot <= 0f) {
+				sr = sg = sb = cfg.selfShade;
+			} else {
+				Vert vt = vertex(kx, ky, kz);
+				if (vt.sunR < 0f) {
+					vl.trace(wx, wy, wz, lx, ly, lz, cfg.quality.rayRange, VoxelLighting.NO_TARGET, 0, 0);
+					vt.sunR = vl.trR;
+					vt.sunG = vl.trG;
+					vt.sunB = vl.trB;
+				}
+				sr = (1f - vt.sunR) * cfg.shadowStrength * strength;
+				sg = (1f - vt.sunG) * cfg.shadowStrength * strength;
+				sb = (1f - vt.sunB) * cfg.shadowStrength * strength;
+			}
+		}
+
+		// ---- block light (per channel)
+		float br = 0f, bg = 0f, bb = 0f, p = 0f;
+		if (lightOn) {
+			Vert vt = vertex(kx, ky, kz);
+			if (vt.bR < 0f) vertexLight(wx, wy, wz, vt);
+			br = vt.bR;
+			bg = vt.bG;
+			bb = vt.bB;
+			p = vt.p;
+		}
+
+		// Per-channel darkness (sun occlusion + torch occlusion) and warm glow.
+		float dr = 1f - (1f - sr * (1f - br)) * (1f - (p - br) * cfg.torchShadow);
+		float dg = 1f - (1f - sg * (1f - bg)) * (1f - (p - bg) * cfg.torchShadow);
+		float db = 1f - (1f - sb * (1f - bb)) * (1f - (p - bb) * cfg.torchShadow);
+		float wr = br * cfg.warmStrength * WARMN[0];
+		float wg = bg * cfg.warmStrength * WARMN[1];
+		float wb = bb * cfg.warmStrength * WARMN[2];
+
+		float aD = Math.max(dr, Math.max(dg, db));
+		float wMax = Math.max(wr, Math.max(wg, wb));
+		float a = Math.min(0.8f, aD + wMax);
+		if (a < 0.02f) return 0;
+
+		// Channels that pass more light lift the overlay colour: that reads as coloured light
+		// inside the shadow. Warm glow adds its own tint.
+		float rr = clamp01((aD - dr) / a + wr / a);
+		float gr = clamp01((aD - dg) / a + wg / a);
+		float br2 = clamp01((aD - db) / a + wb / a);
+		return ((int) (rr * 255f))
+				| ((int) (gr * 255f) << 8)
+				| ((int) (br2 * 255f) << 16)
+				| ((int) (a * 255f) << 24);
 	}
 
 	private static float clamp01(float v) {
@@ -266,8 +289,7 @@ final class SectionBaker {
 	}
 
 	/** Traces the nearby emitters from one corner vertex; fills v.b* (arrives) and v.p (no blockers). */
-	private void vertexLight(int wx, int wy, int wz, Vert v, VtConfig cfg) {
-		final float ox = wx, oy = wy, oz = wz;
+	private void vertexLight(float ox, float oy, float oz, Vert v) {
 		final int kmax = Math.min(cfg.quality.lightRays, 8);
 		int k = 0;
 		for (int c = 0; c < candCount; c++) {
@@ -293,7 +315,7 @@ final class SectionBaker {
 			int c = bestIdx[i];
 			float str = bestStr[i];
 			float tr = 1f, tg = 1f, tb = 1f;
-			if (!(cbx[c] == wx && cby[c] == wy && cbz[c] == wz)) {
+			if (!(cbx[c] == Mth.floor(ox) && cby[c] == Mth.floor(oy) && cbz[c] == Mth.floor(oz))) {
 				float dx = cx[c] - ox, dy = cy[c] - oy, dz = cz[c] - oz;
 				float dist = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
 				float inv = 1f / dist;
@@ -337,13 +359,21 @@ final class SectionBaker {
 		builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
 		for (int q = 0; q < quads; q++) {
 			int p = qPos[q];
-			int x = p & 15, y = (p >> 4) & 15, z = (p >> 8) & 15, d = (p >> 12) & 7;
+			int x = p & 15, y = (p >> 4) & 15, z = (p >> 8) & 15, d = (p >> 12) & 7, si = (p >> 15) & 15;
+			int i = si & (SUB - 1), j = si / SUB;
+			int[] O = FACE[d][0];
+			int[] F1 = FACE[d][1], F3 = FACE[d][3];
+			int ux = F1[0] - O[0], uy = F1[1] - O[1], uz = F1[2] - O[2];
+			int vx = F3[0] - O[0], vy = F3[1] - O[1], vz = F3[2] - O[2];
 			float ox = DX[d] * EPS, oy = DY[d] * EPS, oz = DZ[d] * EPS;
-			int[][] f = FACE[d];
 			for (int v = 0; v < 4; v++) {
+				float fu = (i + UC[v]) * SUBF, fv = (j + VC[v]) * SUBF;
+				float px = x + O[0] + fu * ux + fv * vx;
+				float py = y + O[1] + fu * uy + fv * vy;
+				float pz = z + O[2] + fu * uz + fv * vz;
 				int c = qCol[q * 4 + v];
 				int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >>> 24) & 255;
-				builder.vertex(x + f[v][0] + ox, y + f[v][1] + oy, z + f[v][2] + oz)
+				builder.vertex(px + ox, py + oy, pz + oz)
 						.color(r, g, b, a)
 						.endVertex();
 			}
