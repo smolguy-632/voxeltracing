@@ -158,6 +158,11 @@ final class SectionBaker {
 					if (inside) {
 						int ni = (ny << 8) | (nz << 4) | nx;
 						if ((op[ni >>> 6] & (1L << ni)) != 0L) continue;   // face buried against another solid
+						// face fully covered by a partial block's shape (wall, stair back, fence post...)
+						if (s.ptype != null && (s.ptype[ni] & 255) == VoxelSection.T_PARTIAL_SOLID) {
+							VoxelSection.Mask m = s.masks.get((s.pmask[ni] & 255) - 1);
+							if ((m.covered & (1 << (d ^ 1))) != 0) continue;
+						}
 					} else if (vl.isOpaque(bx + nx, wy, bz + nz)) {
 						continue;
 					}

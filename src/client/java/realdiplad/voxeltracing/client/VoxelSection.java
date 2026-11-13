@@ -78,10 +78,21 @@ final class VoxelSection {
 		FOLIAGE_SUB = (float) Math.pow(FOLIAGE_T, 1.0 / 16.0);
 	}
 
-	/** Shared voxelization cache: block state -> sub-voxel mask (or FULL_MASK). */
-	private static final IdentityHashMap<BlockState, long[]> VOX_CACHE = new IdentityHashMap<>();
+	/** Shared voxelization cache: block state -> sub-voxel mask + face coverage flags. */
+	private static final IdentityHashMap<BlockState, Mask> VOX_CACHE = new IdentityHashMap<>();
 	/** Sentinel: the mask covers the whole block. */
-	private static final long[] FULL_MASK = new long[64];
+	private static final Mask FULL = new Mask(null, 0x3F);
+
+	/** A partial block's 4096-bit shape plus, per face direction, whether that side's 16x16 slice is fully filled. */
+	static final class Mask {
+		final long[] bits;
+		final int covered;
+
+		Mask(long[] bits, int covered) {
+			this.bits = bits;
+			this.covered = covered;
+		}
+	}
 
 	final int sx, sy, sz;
 
@@ -92,7 +103,7 @@ final class VoxelSection {
 	byte[] ptype;    // null => no partial blocks; per block: T_PARTIAL_*
 	byte[] ptint;    // null => no glass; per block: tint palette index
 	byte[] pmask;    // null => no partial blocks; per block: 0 = none, else masks index + 1
-	ArrayList<long[]> masks;
+	ArrayList<Mask> masks;
 	int[] emitters = EMPTY;
 	int emitterCount;
 
@@ -141,9 +152,9 @@ final class VoxelSection {
 		return -1;
 	}
 
-	/** Block state -> 4096-bit sub-voxel mask, or FULL_MASK. Cached per block state. */
-	private static long[] voxelize(BlockState st) {
-		long[] cached = VOX_CACHE.get(st);
+	/** Block state -> 4096-bit sub-voxel mask (or FULL). Cached per block state. */
+	private static Mask voxelize(BlockState st) {
+		Mask cached = VOX_CACHE.get(st);
 		if (cached != null) return cached;
 		long[] m = new long[64];
 		int[] count = {0};
@@ -162,7 +173,41 @@ final class VoxelSection {
 								}
 							}
 				});
-		long[] result = count[0] == 4096 ? FULL_MASK : m;
+		Mask result;
+		if (count[0] == 4096) {
+			result = FULL;
+		} else {
+			int covered = 0;
+			for (int dd = 0; dd < 6; dd++) {
+				int axis = dd >> 1; // 0=y, 1=z, 2=x
+				int side = (dd & 1) == 0 ? 0 : 15;
+				boolean full = true;
+				for (int a = 0; a < 16 && full; a++)
+					for (int b = 0; b < 16; b++) {
+						int y, z, x;
+						if (axis == 0) {
+							y = side;
+							z = a;
+							x = b;
+						} else if (axis == 1) {
+							z = side;
+							y = a;
+							x = b;
+						} else {
+							x = side;
+							y = a;
+							z = b;
+						}
+						int i = (y << 8) | (z << 4) | x;
+						if ((m[i >>> 6] & (1L << (i & 63))) == 0L) {
+							full = false;
+							break;
+						}
+					}
+				if (full) covered |= 1 << dd;
+			}
+			result = new Mask(m, covered);
+		}
 		if (VOX_CACHE.size() >= 4096) VOX_CACHE.clear();
 		VOX_CACHE.put(st, result);
 		return result;
@@ -207,7 +252,7 @@ final class VoxelSection {
 
 		long[] op = null, fo = null, gl = null;
 		byte[] pt = null, pi = null, pm = null;
-		ArrayList<long[]> mk = null;
+		ArrayList<Mask> mk = null;
 		int n = 0;
 		for (int y = 0; y < 16; y++) {
 			for (int z = 0; z < 16; z++) {
@@ -222,8 +267,8 @@ final class VoxelSection {
 							if (op == null) op = new long[64];
 							op[bi >>> 6] |= 1L << bi;
 						} else {
-							long[] m = voxelize(st);
-							if (m == FULL_MASK) {
+							Mask m = voxelize(st);
+							if (m == FULL) {
 								if (type == T_PARTIAL_SOLID) {
 									if (op == null) op = new long[64];
 									op[bi >>> 6] |= 1L << bi;
@@ -320,7 +365,7 @@ final class VoxelSection {
 		}
 
 		// ---- partial block: walk the 16x16x16 grid inside this block
-		long[] mask = masks.get((pmask[bi] & 255) - 1);
+		long[] mask = masks.get((pmask[bi] & 255) - 1).bits;
 		boolean solid = type == T_PARTIAL_SOLID;
 		boolean foliagePart = type == T_FOLIAGE;
 		// T_GLASS in ptype means a partial glass block; fall back to clear glass if the
