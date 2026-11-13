@@ -50,6 +50,8 @@ public final class VtConfig {
 	public boolean blockLight = true;
 	/** Darkness (0..1) of a face that is occluded from the sun by another voxel. */
 	public float shadowStrength = 0.42f;
+	/** Contrast curve on sun-shadow alpha: 0 = soft vanilla-ish fades, 1 = crisp shader-style edges. */
+	public boolean crispShadows = true;
 	/** Darkness (0..1) of a face pointing away from the sun. */
 	public float selfShade = 0.22f;
 	/** Strength (0..1) of the warm tint on faces with line-of-sight to a light source. */
@@ -76,6 +78,7 @@ public final class VtConfig {
 				c.sunShadows = bool(props, "sunShadows", c.sunShadows);
 				c.blockLight = bool(props, "blockLight", c.blockLight);
 				c.shadowStrength = flt(props, "shadowStrength", c.shadowStrength);
+				c.crispShadows = bool(props, "crispShadows", c.crispShadows);
 				c.selfShade = flt(props, "selfShade", c.selfShade);
 				c.warmStrength = flt(props, "warmStrength", c.warmStrength);
 				c.torchShadow = flt(props, "torchShadow", c.torchShadow);
@@ -99,6 +102,7 @@ public final class VtConfig {
 		props.setProperty("sunShadows", Boolean.toString(sunShadows));
 		props.setProperty("blockLight", Boolean.toString(blockLight));
 		props.setProperty("shadowStrength", Float.toString(shadowStrength));
+		props.setProperty("crispShadows", Boolean.toString(crispShadows));
 		props.setProperty("selfShade", Float.toString(selfShade));
 		props.setProperty("warmStrength", Float.toString(warmStrength));
 		props.setProperty("torchShadow", Float.toString(torchShadow));

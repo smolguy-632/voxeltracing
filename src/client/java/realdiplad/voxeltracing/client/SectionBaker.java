@@ -206,9 +206,9 @@ final class SectionBaker {
 					vt.sunG = vl.trG;
 					vt.sunB = vl.trB;
 				}
-				sr = (1f - vt.sunR) * cfg.shadowStrength * strength;
-				sg = (1f - vt.sunG) * cfg.shadowStrength * strength;
-				sb = (1f - vt.sunB) * cfg.shadowStrength * strength;
+				sr = crisp((1f - vt.sunR) * cfg.shadowStrength * strength);
+				sg = crisp((1f - vt.sunG) * cfg.shadowStrength * strength);
+				sb = crisp((1f - vt.sunB) * cfg.shadowStrength * strength);
 			}
 		}
 
@@ -249,6 +249,17 @@ final class SectionBaker {
 
 	private static float clamp01(float v) {
 		return v < 0f ? 0f : v > 1f ? 1f : v;
+	}
+
+	/**
+	 * Contrast (S-)curve on sun-shadow darkness. Occlusion below ~0.03 becomes invisible,
+	 * above ~0.18 it quickly saturates, so soft penumbra ramps from foliage depth turn into
+	 * crisp edges. Faint stained-glass tint (~0.06) survives as a light tint.
+	 */
+	private static float crisp(float x) {
+		if (!VtConfig.get().crispShadows) return x;
+		float t = clamp01((x - 0.03f) / 0.15f);
+		return t * t * (3f - 2f * t);
 	}
 
 	// ------------------------------------------------------------------ light
