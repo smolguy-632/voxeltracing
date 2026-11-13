@@ -27,7 +27,7 @@ Settings live in `config/voxeltracing.properties` (quality, strengths, sunShadow
 ## How it works
 
 1. **Voxels only.** Each 16x16x16 section is reduced to two 4096-bit bitsets (opaque, foliage) plus a
-   short list of exposed light emitters. Leaves let 55% of light through per voxel.
+   short list of exposed light emitters. Leaves let 55% of light through per voxel. and if it is coloured glass it will make shadows of that colour 
 2. **Ray marching.** Amanatides-Woo 3D-DDA through those bitsets. No BlockState lookups in the hot loop.
 3. **Block-level shading.** Each exposed face looks at the air voxel in front of it; that voxel is traced
    once (memoised) toward the sun and toward the few strongest nearby emitters.
