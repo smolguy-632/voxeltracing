@@ -131,7 +131,13 @@ final class Optics {
 		float[] rgb = hasColor
 				? new float[]{((mc.col >> 16) & 255) / 255f, ((mc.col >> 8) & 255) / 255f, (mc.col & 255) / 255f}
 				: new float[]{0.55f, 0.55f, 0.55f};
-		float[] alb = {clamp(rgb[0], 0.10f, 0.92f), clamp(rgb[1], 0.10f, 0.92f), clamp(rgb[2], 0.10f, 0.92f)};
+		// Map colours are icon-saturated; real surfaces bounce far less coloured light, so pull the
+		// albedo 35% toward its own brightness before it is used for colour bleeding.
+		float luma = 0.30f * rgb[0] + 0.59f * rgb[1] + 0.11f * rgb[2];
+		float[] alb = {
+				clamp(luma + (rgb[0] - luma) * 0.65f, 0.10f, 0.92f),
+				clamp(luma + (rgb[1] - luma) * 0.65f, 0.10f, 0.92f),
+				clamp(luma + (rgb[2] - luma) * 0.65f, 0.10f, 0.92f)};
 		float mx = Math.max(rgb[0], Math.max(rgb[1], Math.max(rgb[2], 0.001f)));
 		float[] norm = {rgb[0] / mx, rgb[1] / mx, rgb[2] / mx};
 

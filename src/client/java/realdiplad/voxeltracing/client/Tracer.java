@@ -112,20 +112,27 @@ final class Tracer {
 							break;
 						}
 						case Optics.TINT: {
-							boolean crosses;
+							boolean tinted = false;
 							if (o.isFull) {
-								crosses = tExit - t > 1e-7;
-							} else {
-								crosses = boxes(o, x, y, z, ox, oy, oz, dx, dy, dz, t - 1e-9, maxLen);
-							}
-							if (crosses) {
+								// full cubes (glass, ice, slime, water) absorb by depth travelled, so a ray that
+								// only clips a corner is barely tinted and stacks fade smoothly
+								double len = Math.min(tExit, maxLen) - Math.max(t, 0.0);
+								if (len > 0) {
+									tr *= (float) Math.exp(len * o.lnr);
+									tg *= (float) Math.exp(len * o.lng);
+									tb *= (float) Math.exp(len * o.lnb);
+									tinted = true;
+								}
+							} else if (boxes(o, x, y, z, ox, oy, oz, dx, dy, dz, t - 1e-9, maxLen)) {
+								// thin shapes (panes): one sheet, one crossing
 								tr *= o.tr;
 								tg *= o.tg;
 								tb *= o.tb;
-								if (tr + tg + tb < 0.01f) {
-									tr = tg = tb = 0f;
-									return;
-								}
+								tinted = true;
+							}
+							if (tinted && tr + tg + tb < 0.01f) {
+								tr = tg = tb = 0f;
+								return;
 							}
 							break;
 						}

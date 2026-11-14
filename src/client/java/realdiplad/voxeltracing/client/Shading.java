@@ -14,6 +14,7 @@ import net.minecraft.util.Mth;
 final class Shading {
 	static final double NOFF = 0.004;
 	private static final float ESUN = 2.2f, EAMB = 1.0f;
+	private static final float GI_CHROMA = 0.5f;
 
 	private final VoxelLighting w;
 	private final Tracer tz;
@@ -188,9 +189,14 @@ final class Shading {
 			refG += rg;
 			refB += rb;
 		}
-		oR = Mth.clamp(sumR / Math.max(refR, 1e-4f), 0f, 3f);
-		oG = Mth.clamp(sumG / Math.max(refG, 1e-4f), 0f, 3f);
-		oB = Mth.clamp(sumB / Math.max(refB, 1e-4f), 0f, 3f);
+		float gr = Mth.clamp(sumR / Math.max(refR, 1e-4f), 0f, 3f);
+		float gg = Mth.clamp(sumG / Math.max(refG, 1e-4f), 0f, 3f);
+		float gb = Mth.clamp(sumB / Math.max(refB, 1e-4f), 0f, 3f);
+		// keep the colour bleed but halve its chroma: it tints shadows, it must not repaint them
+		float mean = (gr + gg + gb) / 3f;
+		oR = mean + (gr - mean) * GI_CHROMA;
+		oG = mean + (gg - mean) * GI_CHROMA;
+		oB = mean + (gb - mean) * GI_CHROMA;
 	}
 
 	// ------------------------------------------------------------------ emitters

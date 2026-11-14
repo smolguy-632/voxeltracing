@@ -1,56 +1,43 @@
-# Voxel Tracing (Fabric, Minecraft 1.20.1)
+# Voxel Tracing 1.4.2
 
-Client-side, voxel-based ray-traced shadows and block light. It never touches vanilla lighting:
-it draws a thin translucent overlay on exposed block faces, so the look stays blocky and
-Minecraft-style, and it is designed to run on low-end CPUs.
+CPU-side voxel ray tracing for Minecraft 1.20.1 (Fabric). There are no shaders: rays are traced on the CPU
+against the real block grid, baked into overlay meshes, and drawn over the vanilla image as a lighting
+correction (a multiply pass for shadows / occlusion / tint, a boost pass for bounced light).
 
-## Build
+## What it does
 
-Requires JDK 17+.
-
-    ./gradlew build          # jar ends up in build/libs/
-    ./gradlew runClient      # test in a dev client
-
-Versions in `gradle.properties` come from the template you supplied (Minecraft 1.20.1,
-loader 0.20.1, loom 1.19-SNAPSHOT, Fabric API 0.92.12+1.20.1). Confirm them against
-https://fabricmc.net/develop/ if Gradle complains.
+- **Sun shadows** that follow the vanilla sun, crisp down to 1/16 block, tinted by glass, slime, honey,
+  ice and water, absorbed by leaves.
+- **Global illumination**: cosine-weighted hemisphere rays per vertex that either reach the sky or hit a
+  surface that is itself lit by sun and sky. This gives ambient occlusion, colour bleeding off sunlit
+  grass / wood / wool into shadow, and brighter undersides near lit ground.
+- **Emitter shadows and colour**: torches, lava, glowstone etc. only light what they can actually see, with
+  their own colour (warm, soul-fire blue, redstone red...).
+- **Every block**: geometry comes from each BlockState's real collision boxes, optics from its render layer,
+  map colour and light level. Stairs, slabs, fences, walls, panes, paths, farmland, carpets, snow layers,
+  and modded blocks need no special cases.
 
 ## Controls
 
-| Key | Action |
-|-----|--------|
-| V   | Toggle on/off |
-| B   | Cycle quality LOW / MEDIUM / HIGH |
+`V` toggles the effect, `B` cycles quality (LOW / MEDIUM / HIGH).
 
-Settings live in `config/voxeltracing.properties` (quality, strengths, sunShadows, blockLight).
+## Config (`config/voxeltracing.properties`)
 
-## How it works
+| key | meaning |
+| --- | --- |
+| `quality` | LOW / MEDIUM / HIGH: radius, ray lengths, GI rays per vertex, bake budget |
+| `gi`, `giStrength` | global illumination on/off and 0..1 strength |
+| `shadowStrength` | how much of the daylight look is the sun (what a fully shadowed face loses) |
+| `crispShadows` | true: shadow edges resolved to 1/16 block, false: 1/4 block |
+| `sunShadows`, `blockLight` | toggle sun shadowing / emitter shadowing |
+| `sunTilt` | sideways tilt of the sun path (0 matches the sun drawn by vanilla) |
+| `warmStrength`, `torchShadow` | emitter colour tint and "unseen torch light" darkening |
 
-1. **Voxels only.** Each 16x16x16 section is reduced to two 4096-bit bitsets (opaque, foliage) plus a
-   short list of exposed light emitters. Leaves let 55% of light through per voxel. and if it is coloured glass it will make shadows of that colour 
-2. **Ray marching.** Amanatides-Woo 3D-DDA through those bitsets. No BlockState lookups in the hot loop.
-3. **Block-level shading.** Each exposed face looks at the air voxel in front of it; that voxel is traced
-   once (memoised) toward the sun and toward the few strongest nearby emitters.
-   - blocked from sun -> dark; facing away from sun -> mild self-shade
-   - line of sight to a torch/lava/glowstone -> warm tint
-   - vanilla light "leaking" round a corner but blocked for rays -> slight darkening (torch shadows)
-4. **Time of day.** Sun direction follows the vanilla sky angle, quantised (48/72/96 steps per day) so
-   shadows are rebaked only at step changes. Night = no sun work at all. Nether/End = block light only.
-5. **Player interaction.** A one-line mixin on `ClientLevel.sendBlockUpdated` marks nearby sections dirty.
-   Changes that don't alter opacity or emission (water flow, doors, crops) are ignored.
+## How it is built
 
-## Why it is cheap
+`Optics` (per-BlockState optical data) -> `Sect` (16^3 snapshots) -> `Tracer` (exact shape ray marcher) ->
+`Shading` (sun / GI / emitters) -> `Baker` (adaptive face meshes) -> `VoxelRenderer` (two blend passes).
+`VoxelLighting` owns the world access and the nearest-first bake scheduler.
 
-- All baking is on the render thread under a hard per-frame budget (0.8 / 1.5 / 2.5 ms for LOW / MEDIUM / HIGH),
-  nearest sections first, so it can never stall a frame for long.
-- Results are static VBOs: per frame it is one frustum test and one draw call per visible section.
-- Faces facing away from the sun need no ray; air voxels shared by several faces are traced once.
-- Fully buried faces, empty sections and distant sections cost nothing.
-
-## Known limits
-
-- Shadows are per block face, not smooth (intentional, matches the voxel style). Smoothing across
-  corners would be the natural next feature.
-- Shadow range is capped by quality (16 / 24 / 32 blocks).
-- Rendering mods that replace the position-color shader or use their own pipelines (some shader packs)
-  may draw the overlay differently.
+Where vanilla already shows darkness (caves, interiors) the effect fades out in proportion to the vanilla sky
+light, so occlusion is never counted twice.
