@@ -22,8 +22,8 @@ import java.util.Arrays;
  * Rays resolve on the per-block 16x16x16 sub-voxel grid and carry an RGB transmittance, so
  * shadows from partial shapes (stairs, slabs, fences, panes...) are true to their silhouette
  * and stained glass tints both the sun shadows and the torch glow beneath it. The per-channel
- * darkness collapses into one translucent quad: channels that pass more light lift the overlay
- * colour, which reads as coloured light inside the shadow.
+ * multiplier renders with a multiplicative blend, so channels that pass more light stay
+ * brighter: lime glass casts a green shadow, not a black one.
  */
 final class SectionBaker {
 	private static final float EPS = 0.003f;
@@ -325,32 +325,28 @@ final class SectionBaker {
 			p = cP[slot];
 		}
 
-		// Per-channel darkness (sun occlusion + torch occlusion) and warm glow.
-		// The torch-leak term only applies where the sun isn't shining on this face: during
-		// the day vanilla's sky light hides the leak, so darkening it would paint phantom
-		// patches onto sunlit walls.
+		// Per-channel multiplier (sun occlusion + torch leak). The mesh renders with a
+		// MULTIPLICATIVE blend, so the overlay can only darken/tint - never brighten. (The old
+		// additive tint produced bright "light pools" behind stained glass and stepped patches
+		// on dark grass.)
 		float tOcc = (sunOn && fDot > 0f) ? 0f : cfg.torchShadow;
-		float dr = 1f - (1f - sr * (1f - br)) * (1f - Math.max(0f, p - br) * tOcc);
-		float dg = 1f - (1f - sg * (1f - bg)) * (1f - Math.max(0f, p - bg) * tOcc);
-		float db = 1f - (1f - sb * (1f - bb)) * (1f - Math.max(0f, p - bb) * tOcc);
-		float wr = br * cfg.warmStrength * WARMN[0];
-		float wg = bg * cfg.warmStrength * WARMN[1];
-		float wb = bb * cfg.warmStrength * WARMN[2];
+		float mr = (1f - sr * (1f - br)) * (1f - Math.max(0f, p - br) * tOcc);
+		float mg = (1f - sg * (1f - bg)) * (1f - Math.max(0f, p - bg) * tOcc);
+		float mb = (1f - sb * (1f - bb)) * (1f - Math.max(0f, p - bb) * tOcc);
+		// Warm tint for faces with a clear torch line-of-sight (multiplicative, like vanilla's).
+		float gt = cfg.warmStrength * Math.max(br, Math.max(bg, bb));
+		mg *= 1f - gt * (1f - WARMN[1]);
+		mb *= 1f - gt * (1f - WARMN[2]);
 
-		float aD = Math.max(dr, Math.max(dg, db));
-		float wMax = Math.max(wr, Math.max(wg, wb));
-		float a = Math.min(0.8f, aD + wMax);
-		if (a < 0.02f) return 0;
+		float dark = Math.max(1f - mr, Math.max(1f - mg, 1f - mb));
+		if (dark < 0.02f) return 0;
 
-		// Channels that pass more light lift the overlay colour: that reads as coloured light
-		// inside the shadow. Warm glow adds its own tint.
-		float rr = clamp01((aD - dr) / a + wr / a);
-		float gr = clamp01((aD - dg) / a + wg / a);
-		float br2 = clamp01((aD - db) / a + wb / a);
-		return ((int) (rr * 255f))
-				| ((int) (gr * 255f) << 8)
-				| ((int) (br2 * 255f) << 16)
-				| ((int) (a * 255f) << 24);
+		// Channels that block less light keep a higher multiplier: the overlay darkens and
+		// tints in one pass, e.g. lime glass casts a green shadow instead of a black one.
+		return ((int) (mr * 255f))
+				| ((int) (mg * 255f) << 8)
+				| ((int) (mb * 255f) << 16)
+				| 0xFF000000;
 	}
 
 	private static float clamp01(float v) {

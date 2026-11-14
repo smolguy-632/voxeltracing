@@ -35,7 +35,9 @@ final class VoxelRenderer {
 		Matrix4f proj = ctx.projectionMatrix();
 
 		RenderSystem.enableBlend();
-		RenderSystem.defaultBlendFunc();
+		// Multiplicative: result = dst * src. The overlay is a tint map - it can darken and
+		// colour-tint the scene, but never lighten it.
+		RenderSystem.blendFunc(GL11.GL_ZERO, GL11.GL_SRC_COLOR);
 		RenderSystem.enableDepthTest();
 		RenderSystem.depthFunc(GL11.GL_LEQUAL);
 		RenderSystem.depthMask(false);
