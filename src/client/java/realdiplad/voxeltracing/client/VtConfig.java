@@ -15,25 +15,36 @@ import java.util.Properties;
 public final class VtConfig {
 
 	public enum Quality {
-		//        chunks  sections  rayRange  bakeBudgetMs  sunSteps/day  lightRays/voxel
-		LOW(3, 2, 16, 0.8f, 48, 2),
-		MEDIUM(5, 3, 24, 1.5f, 72, 3),
-		HIGH(8, 4, 32, 2.5f, 96, 4);
+		//        chunks sections shadowRange giRange giRays bakeBudgetMs sunSteps maxLights lightRadius
+		LOW(3, 2, 32, 12, 3, 0.8f, 24, 2, 10),
+		MEDIUM(5, 3, 48, 16, 6, 1.5f, 32, 3, 12),
+		HIGH(8, 4, 64, 24, 12, 2.5f, 48, 4, 14);
 
 		public final int horizontalRadius;
 		public final int verticalRadius;
-		public final int rayRange;
+		/** Max length (blocks) of a sun shadow ray. */
+		public final int shadowRange;
+		/** Max length (blocks) of a global-illumination ray. */
+		public final int giRange;
+		/** Cosine-weighted hemisphere rays per vertex. */
+		public final int giRays;
 		public final float bakeBudgetMs;
 		public final int sunSteps;
-		public final int lightRays;
+		/** Nearest light sources that get a shadow ray per vertex. */
+		public final int maxLights;
+		public final int lightRadius;
 
-		Quality(int h, int v, int range, float budgetMs, int sunSteps, int lightRays) {
+		Quality(int h, int v, int shadowRange, int giRange, int giRays, float budgetMs, int sunSteps,
+				int maxLights, int lightRadius) {
 			this.horizontalRadius = h;
 			this.verticalRadius = v;
-			this.rayRange = range;
+			this.shadowRange = shadowRange;
+			this.giRange = giRange;
+			this.giRays = giRays;
 			this.bakeBudgetMs = budgetMs;
 			this.sunSteps = sunSteps;
-			this.lightRays = lightRays;
+			this.maxLights = maxLights;
+			this.lightRadius = lightRadius;
 		}
 
 		public Quality next() {
@@ -48,15 +59,19 @@ public final class VtConfig {
 	public Quality quality = Quality.MEDIUM;
 	public boolean sunShadows = true;
 	public boolean blockLight = true;
-	/** Darkness (0..1) of a face that is occluded from the sun by another voxel. */
-	public float shadowStrength = 0.42f;
-	/** Contrast curve on sun-shadow alpha: 0 = soft vanilla-ish fades, 1 = crisp shader-style edges. */
+	/** Global illumination: sky occlusion + coloured light bouncing off sunlit surfaces. */
+	public boolean gi = true;
+	/** 0..1 scale of the GI contribution. */
+	public float giStrength = 0.8f;
+	/** How much of the daylight look comes from the sun (what a fully shadowed face loses), 0..1. */
+	public float shadowStrength = 0.5f;
+	/** true: shadow edges are resolved down to 1/16 block, false: 1/4 block. */
 	public boolean crispShadows = true;
-	/** Darkness (0..1) of a face pointing away from the sun. */
-	public float selfShade = 0.22f;
-	/** Strength (0..1) of the warm tint on faces with line-of-sight to a light source. */
+	/** Sideways tilt of the sun path. 0 matches the sun drawn by the vanilla sky. */
+	public float sunTilt = 0.0f;
+	/** Strength (0..1) of the coloured tint from light sources with line of sight. */
 	public float warmStrength = 0.14f;
-	/** Darkness (0..1) where vanilla light "leaks" around corners but rays are blocked. */
+	/** Darkness (0..1) of torch-lit faces that a light source cannot actually see. */
 	public float torchShadow = 0.35f;
 
 	public static VtConfig get() {
@@ -77,9 +92,11 @@ public final class VtConfig {
 				c.enabled = bool(props, "enabled", c.enabled);
 				c.sunShadows = bool(props, "sunShadows", c.sunShadows);
 				c.blockLight = bool(props, "blockLight", c.blockLight);
+				c.gi = bool(props, "gi", c.gi);
+				c.giStrength = flt(props, "giStrength", c.giStrength);
 				c.shadowStrength = flt(props, "shadowStrength", c.shadowStrength);
 				c.crispShadows = bool(props, "crispShadows", c.crispShadows);
-				c.selfShade = flt(props, "selfShade", c.selfShade);
+				c.sunTilt = flt(props, "sunTilt", c.sunTilt);
 				c.warmStrength = flt(props, "warmStrength", c.warmStrength);
 				c.torchShadow = flt(props, "torchShadow", c.torchShadow);
 				try {
@@ -101,9 +118,11 @@ public final class VtConfig {
 		props.setProperty("quality", quality.name());
 		props.setProperty("sunShadows", Boolean.toString(sunShadows));
 		props.setProperty("blockLight", Boolean.toString(blockLight));
+		props.setProperty("gi", Boolean.toString(gi));
+		props.setProperty("giStrength", Float.toString(giStrength));
 		props.setProperty("shadowStrength", Float.toString(shadowStrength));
 		props.setProperty("crispShadows", Boolean.toString(crispShadows));
-		props.setProperty("selfShade", Float.toString(selfShade));
+		props.setProperty("sunTilt", Float.toString(sunTilt));
 		props.setProperty("warmStrength", Float.toString(warmStrength));
 		props.setProperty("torchShadow", Float.toString(torchShadow));
 		try (Writer w = Files.newBufferedWriter(path())) {

@@ -7,447 +7,299 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 
 /**
- * Owns all voxel data and does the work:
- *  - section storage (16x16x16 sub-voxel grid per block) + a 3D-DDA voxel ray marcher
- *  - sun model (quantised so shadows are rebaked rarely, not every tick)
- *  - a priority queue of sections to (re)bake, drained under a strict per-frame time budget
- * Everything runs on the render thread, so there is no locking.
- *
- * Rays march on the per-block 16x16x16 grid: partial shapes (stairs, slabs, fences, panes...)
- * are walked sub-voxel by sub-voxel, and light passing through glass is attenuated and
- * coloured per channel (see VoxelSection.attenuate).
+ * World access for the tracer plus the bake scheduler: keeps section snapshots, tracks the sun,
+ * and re-bakes overlay meshes nearest-first within a per-frame time budget.
  */
 public final class VoxelLighting {
 	public static final VoxelLighting INSTANCE = new VoxelLighting();
 
 	static final int NO_SUN = -1;
-	static final int NO_TARGET = Integer.MIN_VALUE;
+	static final int EMIT_MIN = 8;
+	private static final long CHUNK_SETTLE_NS = 1_200_000_000L;
+	private static final long EDIT_SETTLE_NS = 150_000_000L;
 
-	final Long2ObjectOpenHashMap<VoxelSection> sections = new Long2ObjectOpenHashMap<>();
+	final Long2ObjectOpenHashMap<Sect> sections = new Long2ObjectOpenHashMap<>();
 	ClientLevel level;
+	int minY, maxY, minSec, maxSec;
 
-	// Sun state. dir points FROM the world TOWARDS the sun.
-	int sunKey = NO_SUN;
+	int sunKey = Integer.MIN_VALUE;
 	float sunStrength;
+	float daylight;
 	float lx = 0f, ly = 1f, lz = 0f;
+	float sunR = 1f, sunG = 0.95f, sunB = 0.85f;
 
-	// Camera section
-	int camSx = Integer.MIN_VALUE, camSy, camSz;
-
-	/** RGB transmittance of the last trace() call. */
-	float trR = 1f, trG = 1f, trB = 1f;
-
-	private final SectionBaker baker = new SectionBaker(this);
-	private final ArrayList<VoxelSection> queue = new ArrayList<>();
-	private int queueHead;
+	private final Baker baker = new Baker(this);
+	private final BlockPos.MutableBlockPos mp = new BlockPos.MutableBlockPos();
+	private final ArrayList<Sect> queue = new ArrayList<>();
+	private int qi;
+	private int camSx = Integer.MIN_VALUE, camSy, camSz;
 	private boolean needsScan = true;
+	private boolean waiting;
+	private long lastScan;
 
-	// One-entry section cache for the ray marcher
-	private VoxelSection cacheSec;
+	private Sect cacheS;
 	private int cSx, cSy, cSz;
-
-	private final float[] acc = new float[3];
 
 	private VoxelLighting() {
 	}
 
-	// ------------------------------------------------------------------ frame hook
+	// ------------------------------------------------------------------ world access (used by tracing)
 
-	public void beginFrame(ClientLevel lvl, Camera camera, float tickDelta) {
-		if (lvl == null) return;
-		VtConfig cfg = VtConfig.get();
-		if (lvl != level) {
-			reset();
-			level = lvl;
+	/** The ready section at these section coordinates, or null (outside the world / chunk not loaded). */
+	Sect sect(int sx, int sy, int sz) {
+		if (sy < minSec || sy >= maxSec || level == null) return null;
+		long k = SectionPos.asLong(sx, sy, sz);
+		Sect s = sections.get(k);
+		if (s == null) {
+			s = new Sect(sx, sy, sz);
+			sections.put(k, s);
 		}
-		if (!cfg.enabled) {
-			if (!sections.isEmpty()) reset();
-			return;
-		}
-
-		updateSun(lvl, cfg, tickDelta);
-
-		Vec3 cam = camera.getPosition();
-		int csx = Mth.floor(cam.x) >> 4, csy = Mth.floor(cam.y) >> 4, csz = Mth.floor(cam.z) >> 4;
-		if (csx != camSx || csy != camSy || csz != camSz) {
-			camSx = csx;
-			camSy = csy;
-			camSz = csz;
-			needsScan = true;
-		}
-
-		if (needsScan) {
-			scan(cfg);
-			needsScan = false;
-		}
-		drainQueue(cfg);
+		if (s.state == Sect.PENDING) s.load(level, EMIT_MIN);
+		return s.state == Sect.READY ? s : null;
 	}
 
-	// ------------------------------------------------------------------ sun
+	Optics optAt(int x, int y, int z) {
+		int sx = x >> 4, sy = y >> 4, sz = z >> 4;
+		Sect s;
+		if (cacheS != null && sx == cSx && sy == cSy && sz == cSz) {
+			s = cacheS;
+		} else {
+			s = sect(sx, sy, sz);
+			cacheS = s;
+			cSx = sx;
+			cSy = sy;
+			cSz = sz;
+		}
+		if (s == null || s.empty) return Optics.NOTHING;
+		int id = s.ids == null ? s.uniform : s.ids[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)];
+		return Optics.byIdx[id];
+	}
+
+	int skyLight(int x, int y, int z) {
+		return level.getBrightness(LightLayer.SKY, mp.set(x, y, z));
+	}
+
+	int blockLight(int x, int y, int z) {
+		return level.getBrightness(LightLayer.BLOCK, mp.set(x, y, z));
+	}
+
+	// ------------------------------------------------------------------ per frame
+
+	public void beginFrame(ClientLevel lvl, Camera cam, float tickDelta) {
+		VtConfig cfg = VtConfig.get();
+		if (!cfg.enabled || lvl == null) return;
+		if (level != lvl) {
+			reset();
+			level = lvl;
+			minY = lvl.getMinBuildHeight();
+			maxY = lvl.getMaxBuildHeight();
+			minSec = lvl.getMinSection();
+			maxSec = lvl.getMaxSection();
+			needsScan = true;
+		}
+		updateSun(lvl, cfg, tickDelta);
+
+		Vec3 p = cam.getPosition();
+		int sx = Mth.floor(p.x) >> 4, sy = Mth.floor(p.y) >> 4, sz = Mth.floor(p.z) >> 4;
+		long now = System.nanoTime();
+		if (sx != camSx || sy != camSy || sz != camSz) {
+			camSx = sx;
+			camSy = sy;
+			camSz = sz;
+			needsScan = true;
+		}
+		if (waiting && now - lastScan > 400_000_000L) needsScan = true;
+		if (needsScan) {
+			needsScan = false;
+			scan(cfg, now);
+		}
+		drain(cfg);
+	}
 
 	private void updateSun(ClientLevel lvl, VtConfig cfg, float tickDelta) {
-		int newKey = NO_SUN;
-		float strength = 0f;
 		DimensionType dt = lvl.dimensionType();
-		if (cfg.sunShadows && dt.hasSkyLight() && !dt.hasCeiling()) {
-			float tod = lvl.getTimeOfDay(tickDelta); // vanilla celestial angle, 0 = noon
+		int key = NO_SUN;
+		float strength = 0f;
+		float day = 0.5f;
+		if (dt.hasSkyLight() && !dt.hasCeiling()) {
+			float tod = lvl.getTimeOfDay(tickDelta);
 			int steps = cfg.quality.sunSteps;
 			int step = Mth.clamp((int) (tod * steps), 0, steps - 1);
 			float angle = (step + 0.5f) / steps * Mth.TWO_PI;
-			// Vanilla sky: sun = (-sin a, cos a, 0). Small constant tilt so shadows aren't purely east-west.
-			float x = -Mth.sin(angle), y = Mth.cos(angle), z = 0.30f;
+			float x = -Mth.sin(angle), y = Mth.cos(angle), z = cfg.sunTilt;
 			float inv = 1f / Mth.sqrt(x * x + y * y + z * z);
 			x *= inv;
 			y *= inv;
 			z *= inv;
-			if (y > 0.06f) {
-				newKey = step;
-				strength = smoothstep(0.06f, 0.40f, y);
+			day = smooth(-0.08f, 0.30f, y);
+			if (cfg.sunShadows && y > 0.06f) {
+				key = step;
+				strength = smooth(0.06f, 0.40f, y);
 				lx = x;
 				ly = y;
 				lz = z;
+				float warm = smooth(0.05f, 0.50f, y);
+				sunR = 1f;
+				sunG = 0.62f + 0.35f * warm;
+				sunB = 0.35f + 0.55f * warm;
 			}
 		}
+		daylight = day;
 		sunStrength = strength;
-		if (newKey != sunKey) {
-			sunKey = newKey;
+		if (key != sunKey) {
+			sunKey = key;
 			needsScan = true;
 		}
 	}
 
-	private static float smoothstep(float a, float b, float v) {
+	private static float smooth(float a, float b, float v) {
 		float t = Mth.clamp((v - a) / (b - a), 0f, 1f);
 		return t * t * (3f - 2f * t);
 	}
 
 	// ------------------------------------------------------------------ scheduling
 
-	private void scan(VtConfig cfg) {
-		queue.clear();
-		queueHead = 0;
-		cacheSec = null;
+	private void scan(VtConfig cfg, long now) {
+		VtConfig.Quality q = cfg.quality;
+		int hr = q.horizontalRadius, vr = q.verticalRadius;
+		int margin = (q.shadowRange >> 4) + 2;
+		lastScan = now;
+		waiting = false;
+		cacheS = null;
 
-		int hr = cfg.quality.horizontalRadius, vr = cfg.quality.verticalRadius;
-		int y0 = Math.max(level.getMinSection(), camSy - vr);
-		int y1 = Math.min(level.getMaxSection() - 1, camSy + vr);
-
-		for (int dx = -hr; dx <= hr; dx++) {
-			for (int dz = -hr; dz <= hr; dz++) {
-				if (dx * dx + dz * dz > hr * hr + hr) continue;
-				int sx = camSx + dx, sz = camSz + dz;
-				if (!level.getChunkSource().hasChunk(sx, sz)) continue;
-				for (int sy = y0; sy <= y1; sy++) {
-					long key = SectionPos.asLong(sx, sy, sz);
-					VoxelSection s = sections.get(key);
-					if (s == null) {
-						s = new VoxelSection(sx, sy, sz);
-						sections.put(key, s);
-					}
-					if (s.dirty || s.bakedKey != sunKey) {
-						int dy = sy - camSy;
-						s.sortKey = (s.urgent ? 0 : 100000) + dx * dx + dy * dy + dz * dz;
-						queue.add(s);
-					}
-				}
-			}
-		}
-		queue.sort((a, b) -> Integer.compare(a.sortKey, b.sortKey));
-
-		// Evict sections that drifted well outside the area (their VBOs are freed too).
-		int evH = hr + 3, evV = vr + 2;
-		ObjectIterator<VoxelSection> it = sections.values().iterator();
+		ObjectIterator<Sect> it = sections.values().iterator();
 		while (it.hasNext()) {
-			VoxelSection s = it.next();
-			if (Math.abs(s.sx - camSx) > evH || Math.abs(s.sz - camSz) > evH || Math.abs(s.sy - camSy) > evV) {
+			Sect s = it.next();
+			if (Math.abs(s.sx - camSx) > hr + margin || Math.abs(s.sz - camSz) > hr + margin
+					|| Math.abs(s.sy - camSy) > vr + margin) {
 				s.close();
 				it.remove();
 			}
 		}
-	}
 
-	private void drainQueue(VtConfig cfg) {
-		if (queueHead >= queue.size()) return;
-		long deadline = System.nanoTime() + (long) (cfg.quality.bakeBudgetMs * 1_000_000.0);
-		cacheSec = null;
-		while (queueHead < queue.size()) {
-			VoxelSection s = queue.get(queueHead++);
-			if (s.removed) continue;
-			if (!s.dirty && s.bakedKey == sunKey) continue;
-			baker.bake(s, cfg);
-			if (System.nanoTime() >= deadline) break; // always makes progress: at least one bake per frame
-		}
-	}
-
-	// ------------------------------------------------------------------ world change hooks
-
-	public void onBlockChanged(ClientLevel lvl, BlockPos pos, BlockState oldS, BlockState newS) {
-		VtConfig cfg = VtConfig.get();
-		if (!cfg.enabled || lvl != level) return;
-		// Water flowing, doors opening, crops growing... none of it changes opacity/emission.
-		if (VoxelSection.classify(oldS) == VoxelSection.classify(newS)) return;
-
-		int sx = pos.getX() >> 4, sy = pos.getY() >> 4, sz = pos.getZ() >> 4;
-		int r = Math.max(1, (cfg.quality.rayRange + 15) >> 4);
-		for (int dx = -r; dx <= r; dx++) {
-			for (int dy = -r; dy <= r; dy++) {
-				for (int dz = -r; dz <= r; dz++) {
-					VoxelSection s = sections.get(SectionPos.asLong(sx + dx, sy + dy, sz + dz));
-					if (s == null) continue;
-					if (dx == 0 && dy == 0 && dz == 0) s.invalidateData();
-					s.dirty = true;
-					if (Math.max(Math.abs(dx), Math.max(Math.abs(dy), Math.abs(dz))) <= 1) s.urgent = true;
+		queue.clear();
+		qi = 0;
+		for (int dx = -hr; dx <= hr; dx++) {
+			for (int dz = -hr; dz <= hr; dz++) {
+				for (int dy = -vr; dy <= vr; dy++) {
+					int sy = camSy + dy;
+					if (sy < minSec || sy >= maxSec) continue;
+					long k = SectionPos.asLong(camSx + dx, sy, camSz + dz);
+					Sect s = sections.get(k);
+					if (s == null) {
+						s = new Sect(camSx + dx, sy, camSz + dz);
+						sections.put(k, s);
+					}
+					if (!s.dirty && s.bakedKey == sunKey) continue;
+					if (s.notBefore > now) {
+						waiting = true;
+						continue;
+					}
+					long d2 = (long) dx * dx + (long) dz * dz + (long) dy * dy * 2L;
+					s.sortKey = (s.urgent ? 0L : 1_000_000L) + d2;
+					queue.add(s);
 				}
 			}
 		}
-		cacheSec = null;
+		queue.sort(Comparator.comparingLong(a -> a.sortKey));
+	}
+
+	private void drain(VtConfig cfg) {
+		long deadline = System.nanoTime() + (long) (cfg.quality.bakeBudgetMs * 1_000_000.0);
+		while (qi < queue.size()) {
+			Sect s = queue.get(qi++);
+			if (s.removed || (!s.dirty && s.bakedKey == sunKey)) continue;
+			baker.bake(s, cfg);
+			if (System.nanoTime() > deadline) break;
+		}
+	}
+
+	// ------------------------------------------------------------------ change hooks
+
+	public void onBlockChanged(ClientLevel lvl, BlockPos pos, BlockState oldState, BlockState newState) {
+		if (level == null || lvl != level) return;
+		Optics a = Optics.of(oldState), b = Optics.of(newState);
+		if (a.sameAs(b)) return;
+		cacheS = null;
+
+		int sx = pos.getX() >> 4, sy = pos.getY() >> 4, sz = pos.getZ() >> 4;
+		Sect own = sections.get(SectionPos.asLong(sx, sy, sz));
+		if (own != null) own.state = Sect.PENDING;
+
+		VtConfig.Quality q = VtConfig.get().quality;
+		int r = Math.max(1, (Math.max(Math.max(q.shadowRange, q.giRange), q.lightRadius) + 15) >> 4);
+		long settle = System.nanoTime() + EDIT_SETTLE_NS;
+		for (int dx = -r; dx <= r; dx++) {
+			for (int dz = -r; dz <= r; dz++) {
+				for (int dy = -r; dy <= r; dy++) {
+					Sect s = sections.get(SectionPos.asLong(sx + dx, sy + dy, sz + dz));
+					if (s == null) continue;
+					s.dirty = true;
+					s.urgent = Math.abs(dx) <= 1 && Math.abs(dy) <= 1 && Math.abs(dz) <= 1;
+					s.notBefore = settle;
+				}
+			}
+		}
 		needsScan = true;
 	}
 
 	public void onChunkLoad(ClientLevel lvl, int cx, int cz) {
-		if (!VtConfig.get().enabled || lvl != level) return;
-		int minS = lvl.getMinSection(), maxS = lvl.getMaxSection();
+		if (level == null || lvl != level) return;
+		cacheS = null;
+		long settle = System.nanoTime() + CHUNK_SETTLE_NS;
 		for (int dx = -1; dx <= 1; dx++) {
 			for (int dz = -1; dz <= 1; dz++) {
-				for (int sy = minS; sy < maxS; sy++) {
-					VoxelSection s = sections.get(SectionPos.asLong(cx + dx, sy, cz + dz));
+				for (int sy = minSec; sy < maxSec; sy++) {
+					Sect s = sections.get(SectionPos.asLong(cx + dx, sy, cz + dz));
 					if (s == null) continue;
-					if (dx == 0 && dz == 0) s.invalidateData();
+					if ((dx == 0 && dz == 0) || s.state == Sect.MISSING) s.state = Sect.PENDING;
 					s.dirty = true;
-					s.urgent = true;
+					s.notBefore = settle;
 				}
 			}
 		}
-		cacheSec = null;
 		needsScan = true;
 	}
 
 	public void onChunkUnload(ClientLevel lvl, int cx, int cz) {
-		if (lvl != level) return;
-		for (int sy = lvl.getMinSection(); sy < lvl.getMaxSection(); sy++) {
-			VoxelSection s = sections.remove(SectionPos.asLong(cx, sy, cz));
+		if (level == null || lvl != level) return;
+		cacheS = null;
+		for (int sy = minSec; sy < maxSec; sy++) {
+			Sect s = sections.remove(SectionPos.asLong(cx, sy, cz));
 			if (s != null) s.close();
 		}
-		cacheSec = null;
-	}
-
-	/** Re-bake everything (quality / settings changed). */
-	public void invalidateAll() {
-		for (VoxelSection s : sections.values()) s.dirty = true;
-		sunKey = Integer.MIN_VALUE; // force sun re-evaluation
 		needsScan = true;
 	}
 
-	public void reset() {
-		for (VoxelSection s : sections.values()) s.close();
-		sections.clear();
-		queue.clear();
-		queueHead = 0;
-		cacheSec = null;
-		camSx = Integer.MIN_VALUE;
+	public void invalidateAll() {
+		cacheS = null;
+		for (Sect s : sections.values()) {
+			s.dirty = true;
+			s.notBefore = 0L;
+		}
 		sunKey = Integer.MIN_VALUE;
 		needsScan = true;
 	}
 
-	// ------------------------------------------------------------------ voxel access
-
-	/** Returns the section (creating a placeholder if needed), or null outside the world's height. */
-	VoxelSection getSection(int sx, int sy, int sz, boolean load) {
-		if (sy < level.getMinSection() || sy >= level.getMaxSection()) return null;
-		long key = SectionPos.asLong(sx, sy, sz);
-		VoxelSection s = sections.get(key);
-		if (s == null) {
-			s = new VoxelSection(sx, sy, sz);
-			sections.put(key, s);
-		}
-		if (load && s.loadState == VoxelSection.NOT_TRIED) s.load(level);
-		return s;
-	}
-
-	boolean isOpaque(int x, int y, int z) {
-		VoxelSection s = section(x, y, z);
-		if (s == null || s.opaque == null) return false;
-		int bi = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
-		return (s.opaque[bi >>> 6] & (1L << bi)) != 0L;
-	}
-
-	private VoxelSection section(int x, int y, int z) {
-		int sx = x >> 4, sy = y >> 4, sz = z >> 4;
-		if (cacheSec != null && sx == cSx && sy == cSy && sz == cSz) return cacheSec;
-		VoxelSection s = getSection(sx, sy, sz, true);
-		cacheSec = s;
-		cSx = sx;
-		cSy = sy;
-		cSz = sz;
-		return s;
-	}
-
-	/**
-	 * Amanatides-Woo traversal accelerated by the per-section sparse voxel octree, from
-	 * (ox,oy,oz) along a UNIT direction for maxLen blocks. The start block is assumed open.
-	 * Stops early when it enters the target block (tx,ty,tz). Whole sections, 8^3 halves,
-	 * 4^3 cells and 2^3 cells that contain no attenuating content are skipped in one jump;
-	 * fully opaque sections block instantly. Every evaluated block is walked on the 16x16x16
-	 * sub-voxel grid; light passing through partial shapes and glass is attenuated / coloured
-	 * per channel. Results land in trR/trG/trB.
-	 */
-	void trace(double ox, double oy, double oz, double dx, double dy, double dz, double maxLen,
-			   int tx, int ty, int tz) {
-		acc[0] = acc[1] = acc[2] = 1f;
-		int x = Mth.floor(ox), y = Mth.floor(oy), z = Mth.floor(oz);
-		int stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
-		final double inf = Double.POSITIVE_INFINITY;
-		double invX = dx != 0 ? 1.0 / Math.abs(dx) : inf;
-		double invY = dy != 0 ? 1.0 / Math.abs(dy) : inf;
-		double invZ = dz != 0 ? 1.0 / Math.abs(dz) : inf;
-		double tMaxX = dx > 0 ? (x + 1 - ox) * invX : dx < 0 ? (ox - x) * invX : inf;
-		double tMaxY = dy > 0 ? (y + 1 - oy) * invY : dy < 0 ? (oy - y) * invY : inf;
-		double tMaxZ = dz > 0 ? (z + 1 - oz) * invZ : dz < 0 ? (oz - z) * invZ : inf;
-
-		final int minY = level.getMinBuildHeight(), maxY = level.getMaxBuildHeight();
-		double tn = 0;               // distance at which the ray entered the current block
-		boolean evaluate = false;    // the start block is assumed open
-		long curSec = Long.MIN_VALUE; // force an octree check on the first block
-		while (true) {
-			if (tn > maxLen) break;
-			if (y < minY || y >= maxY) break; // left the world vertically: nothing more to hit
-			if (evaluate && x == tx && y == ty && z == tz) break; // arrived at the emitter block
-
-			// ---- octree skip on entering a new section
-			long sp = SectionPos.asLong(x >> 4, y >> 4, z >> 4);
-			if (sp != curSec) {
-				curSec = sp;
-				double j = svoSkip(x, y, z, ox, oy, oz, dx, dy, dz, invX, invY, invZ, tx, ty, tz);
-				if (j == BLOCKED) {
-					acc[0] = acc[1] = acc[2] = 0f;
-					break;
-				}
-				if (j > tn) {
-					// re-anchor just past the skipped cell; the anchor block gets evaluated
-					double na = j + 1e-7;
-					if (na > maxLen) break;
-					double px = ox + dx * na, py = oy + dy * na, pz = oz + dz * na;
-					x = Mth.floor(px);
-					y = Mth.floor(py);
-					z = Mth.floor(pz);
-					tMaxX = dx > 0 ? na + (Mth.floor(px) + 1 - px) * invX : dx < 0 ? na + (px - Mth.floor(px)) * invX : inf;
-					tMaxY = dy > 0 ? na + (Mth.floor(py) + 1 - py) * invY : dy < 0 ? na + (py - Mth.floor(py)) * invY : inf;
-					tMaxZ = dz > 0 ? na + (Mth.floor(pz) + 1 - pz) * invZ : dz < 0 ? na + (pz - Mth.floor(pz)) * invZ : inf;
-					tn = na;
-					evaluate = true;
-					curSec = Long.MIN_VALUE; // chained skips within / across sections
-					continue;
-				}
-			}
-
-			// ---- attenuate the current block over its span inside the ray
-			if (evaluate) {
-				double exitD = Math.min(tMaxX, Math.min(tMaxY, tMaxZ));
-				double len = Math.min(exitD, maxLen) - tn;
-				if (len > 0) {
-					VoxelSection s = section(x, y, z);
-					if (s != null && s.loadState == VoxelSection.READY
-							&& (s.opaque != null || s.ptype != null || s.foliage != null || s.glass != null)) {
-						double lx = ox + dx * tn - ((x >> 4) << 4);
-						double ly = oy + dy * tn - ((y >> 4) << 4);
-						double lz = oz + dz * tn - ((z >> 4) << 4);
-						int bi = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
-						if (!s.attenuate(bi, lx, ly, lz, dx, dy, dz, len, acc)) {
-							acc[0] = acc[1] = acc[2] = 0f;
-							break;
-						}
-					}
-				}
-			}
-
-			// ---- step to the next block
-			if (tMaxX < tMaxY) {
-				if (tMaxX < tMaxZ) {
-					tn = tMaxX;
-					x += stepX;
-					tMaxX += invX;
-				} else {
-					tn = tMaxZ;
-					z += stepZ;
-					tMaxZ += invZ;
-				}
-			} else if (tMaxY < tMaxZ) {
-				tn = tMaxY;
-				y += stepY;
-				tMaxY += invY;
-			} else {
-				tn = tMaxZ;
-				z += stepZ;
-				tMaxZ += invZ;
-			}
-			evaluate = true;
-		}
-		trR = acc[0];
-		trG = acc[1];
-		trB = acc[2];
-	}
-
-	private static final double BLOCKED = -2;
-
-	/**
-	 * Octree descent for the section containing block (x,y,z): returns the distance at which
-	 * the ray leaves the largest empty cell around the current block (whole empty section,
-	 * 8^3 half, 4^3 or 2^3 cell), BLOCKED for an all-opaque section, or -1 when nothing
-	 * can be skipped. Never skips a cell containing the target block.
-	 */
-	private double svoSkip(int x, int y, int z, double ox, double oy, double oz,
-						   double dx, double dy, double dz, double invX, double invY, double invZ,
-						   int tx, int ty, int tz) {
-		VoxelSection s = section(x, y, z);
-		int sx = (x >> 4) << 4, sy = (y >> 4) << 4, sz = (z >> 4) << 4;
-		if (s == null || s.occ1 == null) {
-			if (inCell(tx, ty, tz, sx, sy, sz, 16)) return -1;
-			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx, sy, sz, 16);
-		}
-		if (s.allOpaque) {
-			if (inCell(tx, ty, tz, sx, sy, sz, 16)) return -1;
-			return BLOCKED;
-		}
-		int cx = x & 15, cy = y & 15, cz = z & 15;
-		int i1 = ((cy >> 3) << 2) | ((cz >> 3) << 1) | (cx >> 3);
-		if ((s.occ1[0] & (1L << i1)) == 0L) {
-			if (inCell(tx, ty, tz, sx + (cx & -8), sy + (cy & -8), sz + (cz & -8), 8)) return -1;
-			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx + (cx & -8), sy + (cy & -8), sz + (cz & -8), 8);
-		}
-		int i2 = ((cy >> 2) << 4) | ((cz >> 2) << 2) | (cx >> 2);
-		if ((s.occ2[0] & (1L << i2)) == 0L) {
-			if (inCell(tx, ty, tz, sx + (cx & -4), sy + (cy & -4), sz + (cz & -4), 4)) return -1;
-			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx + (cx & -4), sy + (cy & -4), sz + (cz & -4), 4);
-		}
-		int i3 = ((cy >> 1) << 6) | ((cz >> 1) << 3) | (cx >> 1);
-		if ((s.occ3[i3 >>> 6] & (1L << (i3 & 63))) == 0L) {
-			if (inCell(tx, ty, tz, sx + (cx & -2), sy + (cy & -2), sz + (cz & -2), 2)) return -1;
-			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx + (cx & -2), sy + (cy & -2), sz + (cz & -2), 2);
-		}
-		return -1;
-	}
-
-	/** Ray distance at which the ray exits the axis-aligned cell [b, b+size) on any axis. */
-	private static double cellExit(double ox, double oy, double oz, double dx, double dy, double dz,
-								   double invX, double invY, double invZ,
-								   double bx, double by, double bz, double size) {
-		double d = Double.POSITIVE_INFINITY;
-		if (dx > 0) d = Math.min(d, (bx + size - ox) * invX);
-		else if (dx < 0) d = Math.min(d, (ox - bx) * invX);
-		if (dy > 0) d = Math.min(d, (by + size - oy) * invY);
-		else if (dy < 0) d = Math.min(d, (oy - by) * invY);
-		if (dz > 0) d = Math.min(d, (bz + size - oz) * invZ);
-		else if (dz < 0) d = Math.min(d, (oz - bz) * invZ);
-		return d;
-	}
-
-	private static boolean inCell(int tx, int ty, int tz, double bx, double by, double bz, double size) {
-		return tx >= bx && tx < bx + size && ty >= by && ty < by + size && tz >= bz && tz < bz + size;
+	public void reset() {
+		for (Sect s : sections.values()) s.close();
+		sections.clear();
+		queue.clear();
+		qi = 0;
+		cacheS = null;
+		level = null;
+		sunKey = Integer.MIN_VALUE;
+		camSx = Integer.MIN_VALUE;
+		needsScan = true;
+		Optics.reset();
 	}
 }
