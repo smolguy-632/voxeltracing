@@ -257,10 +257,22 @@ final class SectionBaker {
 		int c11 = cornerLight(fKx0 + (u + s) * fUx + (v + s) * fVx, fKy0 + (u + s) * fUy + (v + s) * fVy, fKz0 + (u + s) * fUz + (v + s) * fVz);
 		int c01 = cornerLight(fKx0 + u * fUx + (v + s) * fVx, fKy0 + u * fUy + (v + s) * fVy, fKz0 + u * fUz + (v + s) * fVz);
 
-		if (s <= minSub || (c00 == c10 && c10 == c11 && c11 == c01)) {
+		if (s <= minSub) {
 			if ((c00 | c10 | c11 | c01) != 0)
 				addQuad(basePos, u | (v << 5) | (s << 10), c00, c10, c11, c01);
 			return;
+		}
+		if (c00 == c10 && c10 == c11 && c11 == c01) {
+			// Four equal corners can still hide a light pool or a thin shadow crossing the
+			// middle: verify the centre before merging the whole region.
+			int h = s >> 1;
+			int cc = cornerLight(fKx0 + (u + h) * fUx + (v + h) * fVx,
+					fKy0 + (u + h) * fUy + (v + h) * fVy, fKz0 + (u + h) * fUz + (v + h) * fVz);
+			if (cc == c00) {
+				if (c00 != 0)
+					addQuad(basePos, u | (v << 5) | (s << 10), c00, c10, c11, c01);
+				return;
+			}
 		}
 		int h = s >> 1;
 		emitRegion(basePos, u, v, h);
@@ -280,7 +292,7 @@ final class SectionBaker {
 		float sr = 0f, sg = 0f, sb = 0f;
 		if (sunOn) {
 			if (fDot <= 0f) {
-				sr = sg = sb = cfg.selfShade;
+				sr = sg = sb = cfg.selfShade * strength;
 			} else {
 				int slot = cornerSlot(vkey(kx, ky, kz));
 				if (cSunR[slot] < 0f) {
@@ -289,9 +301,16 @@ final class SectionBaker {
 					cSunG[slot] = vl.trG;
 					cSunB[slot] = vl.trB;
 				}
-				sr = crisp((1f - cSunR[slot]) * cfg.shadowStrength * strength);
-				sg = crisp((1f - cSunG[slot]) * cfg.shadowStrength * strength);
-				sb = crisp((1f - cSunB[slot]) * cfg.shadowStrength * strength);
+				// S-curve on the RAW occlusion of the worst channel, then scale by
+				// shadowStrength: a full shadow stops at shadowStrength (0.42) instead of
+				// saturating to opaque black, while per-channel ratios (glass tint) survive.
+				float oR = 1f - cSunR[slot], oG = 1f - cSunG[slot], oB = 1f - cSunB[slot];
+				float oMax = Math.max(oR, Math.max(oG, oB));
+				float amt = 0f;
+				if (oMax > 1e-4f) amt = cfg.shadowStrength * strength * crisp(oMax) / oMax;
+				sr = amt * oR;
+				sg = amt * oG;
+				sb = amt * oB;
 			}
 		}
 
@@ -307,9 +326,13 @@ final class SectionBaker {
 		}
 
 		// Per-channel darkness (sun occlusion + torch occlusion) and warm glow.
-		float dr = 1f - (1f - sr * (1f - br)) * (1f - (p - br) * cfg.torchShadow);
-		float dg = 1f - (1f - sg * (1f - bg)) * (1f - (p - bg) * cfg.torchShadow);
-		float db = 1f - (1f - sb * (1f - bb)) * (1f - (p - bb) * cfg.torchShadow);
+		// The torch-leak term only applies where the sun isn't shining on this face: during
+		// the day vanilla's sky light hides the leak, so darkening it would paint phantom
+		// patches onto sunlit walls.
+		float tOcc = (sunOn && fDot > 0f) ? 0f : cfg.torchShadow;
+		float dr = 1f - (1f - sr * (1f - br)) * (1f - Math.max(0f, p - br) * tOcc);
+		float dg = 1f - (1f - sg * (1f - bg)) * (1f - Math.max(0f, p - bg) * tOcc);
+		float db = 1f - (1f - sb * (1f - bb)) * (1f - Math.max(0f, p - bb) * tOcc);
 		float wr = br * cfg.warmStrength * WARMN[0];
 		float wg = bg * cfg.warmStrength * WARMN[1];
 		float wb = bb * cfg.warmStrength * WARMN[2];
@@ -335,9 +358,10 @@ final class SectionBaker {
 	}
 
 	/**
-	 * Contrast (S-)curve on sun-shadow darkness. Occlusion below ~0.03 becomes invisible,
-	 * above ~0.18 it quickly saturates, so soft penumbra ramps from foliage depth turn into
-	 * crisp edges. Faint stained-glass tint (~0.06) survives as a light tint.
+	 * Contrast (S-)curve on RAW sun occlusion (0..1). Below ~0.03 it becomes invisible,
+	 * above ~0.18 it saturates to a full shadow; the caller then scales by shadowStrength,
+	 * so a full shadow lands at shadowStrength (never opaque black) and per-channel
+	 * ratios (glass tint) are preserved.
 	 */
 	private static float crisp(float x) {
 		if (!VtConfig.get().crispShadows) return x;
