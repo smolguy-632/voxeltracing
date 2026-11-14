@@ -104,6 +104,12 @@ final class VoxelSection {
 	byte[] ptint;    // null => no glass; per block: tint palette index
 	byte[] pmask;    // null => no partial blocks; per block: 0 = none, else masks index + 1
 	ArrayList<Mask> masks;
+
+	// Sparse voxel octree occupancy over the section's blocks (content = opaque | foliage |
+	// glass | partial). occ1: 2x2x2 halves of 8^3 blocks, occ2: 4^3 cells, occ3: 2^3 cells.
+	// null occ1 => the section is empty; the ray marcher skips such cells in one jump.
+	long[] occ1, occ2, occ3;
+	boolean allOpaque;
 	int[] emitters = EMPTY;
 	int emitterCount;
 
@@ -222,6 +228,8 @@ final class VoxelSection {
 		ptint = null;
 		pmask = null;
 		masks = null;
+		occ1 = occ2 = occ3 = null;
+		allOpaque = false;
 		emitters = EMPTY;
 		emitterCount = 0;
 	}
@@ -234,6 +242,8 @@ final class VoxelSection {
 		ptint = null;
 		pmask = null;
 		masks = null;
+		occ1 = occ2 = occ3 = null;
+		allOpaque = false;
 		emitters = EMPTY;
 		emitterCount = 0;
 
@@ -326,6 +336,34 @@ final class VoxelSection {
 		if (keep != null) {
 			emitters = keep;
 			emitterCount = kept;
+		}
+		// ---- sparse voxel octree occupancy (cells of 8^3 / 4^3 / 2^3 blocks)
+		if (op != null || fo != null || gl != null || pt != null) {
+			long[] o1 = new long[1], o2 = new long[1], o3 = new long[8];
+			for (int y = 0; y < 16; y++) {
+				for (int z = 0; z < 16; z++) {
+					for (int x = 0; x < 16; x++) {
+						int bi = (y << 8) | (z << 4) | x;
+						boolean content = (op != null && (op[bi >>> 6] & (1L << bi)) != 0L)
+								|| (fo != null && (fo[bi >>> 6] & (1L << bi)) != 0L)
+								|| (gl != null && (gl[bi >>> 6] & (1L << bi)) != 0L)
+								|| (pt != null && pt[bi] != 0);
+						if (!content) continue;
+						int i3 = ((y >> 1) << 6) | ((z >> 1) << 3) | (x >> 1);
+						o3[i3 >>> 6] |= 1L << (i3 & 63);
+						o2[0] |= 1L << (((y >> 2) << 4) | ((z >> 2) << 2) | (x >> 2));
+						o1[0] |= 1L << (((y >> 3) << 2) | ((z >> 3) << 1) | (x >> 3));
+					}
+				}
+			}
+			occ1 = o1;
+			occ2 = o2;
+			occ3 = o3;
+		}
+		if (op != null) {
+			int opaqueCount = 0;
+			for (long w : op) opaqueCount += Long.bitCount(w);
+			allOpaque = opaqueCount == 4096;
 		}
 		opaque = op;
 		foliage = fo;

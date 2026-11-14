@@ -289,11 +289,13 @@ public final class VoxelLighting {
 	}
 
 	/**
-	 * Amanatides-Woo traversal on the per-block 16x16x16 grid, from (ox,oy,oz) along a UNIT
-	 * direction for maxLen blocks. The start block is assumed open. Stops early when it enters
-	 * the target block (tx,ty,tz). Every block is evaluated on the sub-voxel grid; light passing
-	 * through partial shapes and glass is attenuated / coloured per channel.
-	 * Results land in trR/trG/trB.
+	 * Amanatides-Woo traversal accelerated by the per-section sparse voxel octree, from
+	 * (ox,oy,oz) along a UNIT direction for maxLen blocks. The start block is assumed open.
+	 * Stops early when it enters the target block (tx,ty,tz). Whole sections, 8^3 halves,
+	 * 4^3 cells and 2^3 cells that contain no attenuating content are skipped in one jump;
+	 * fully opaque sections block instantly. Every evaluated block is walked on the 16x16x16
+	 * sub-voxel grid; light passing through partial shapes and glass is attenuated / coloured
+	 * per channel. Results land in trR/trG/trB.
 	 */
 	void trace(double ox, double oy, double oz, double dx, double dy, double dz, double maxLen,
 			   int tx, int ty, int tz) {
@@ -309,8 +311,62 @@ public final class VoxelLighting {
 		double tMaxZ = dz > 0 ? (z + 1 - oz) * invZ : dz < 0 ? (oz - z) * invZ : inf;
 
 		final int minY = level.getMinBuildHeight(), maxY = level.getMaxBuildHeight();
+		double tn = 0;               // distance at which the ray entered the current block
+		boolean evaluate = false;    // the start block is assumed open
+		long curSec = Long.MIN_VALUE; // force an octree check on the first block
 		while (true) {
-			double tn;
+			if (tn > maxLen) break;
+			if (y < minY || y >= maxY) break; // left the world vertically: nothing more to hit
+			if (evaluate && x == tx && y == ty && z == tz) break; // arrived at the emitter block
+
+			// ---- octree skip on entering a new section
+			long sp = SectionPos.asLong(x >> 4, y >> 4, z >> 4);
+			if (sp != curSec) {
+				curSec = sp;
+				double j = svoSkip(x, y, z, ox, oy, oz, dx, dy, dz, invX, invY, invZ, tx, ty, tz);
+				if (j == BLOCKED) {
+					acc[0] = acc[1] = acc[2] = 0f;
+					break;
+				}
+				if (j > tn) {
+					// re-anchor just past the skipped cell; the anchor block gets evaluated
+					double na = j + 1e-7;
+					if (na > maxLen) break;
+					double px = ox + dx * na, py = oy + dy * na, pz = oz + dz * na;
+					x = Mth.floor(px);
+					y = Mth.floor(py);
+					z = Mth.floor(pz);
+					tMaxX = dx > 0 ? na + (Mth.floor(px) + 1 - px) * invX : dx < 0 ? na + (px - Mth.floor(px)) * invX : inf;
+					tMaxY = dy > 0 ? na + (Mth.floor(py) + 1 - py) * invY : dy < 0 ? na + (py - Mth.floor(py)) * invY : inf;
+					tMaxZ = dz > 0 ? na + (Mth.floor(pz) + 1 - pz) * invZ : dz < 0 ? na + (pz - Mth.floor(pz)) * invZ : inf;
+					tn = na;
+					evaluate = true;
+					curSec = Long.MIN_VALUE; // chained skips within / across sections
+					continue;
+				}
+			}
+
+			// ---- attenuate the current block over its span inside the ray
+			if (evaluate) {
+				double exitD = Math.min(tMaxX, Math.min(tMaxY, tMaxZ));
+				double len = Math.min(exitD, maxLen) - tn;
+				if (len > 0) {
+					VoxelSection s = section(x, y, z);
+					if (s != null && s.loadState == VoxelSection.READY
+							&& (s.opaque != null || s.ptype != null || s.foliage != null || s.glass != null)) {
+						double lx = ox + dx * tn - ((x >> 4) << 4);
+						double ly = oy + dy * tn - ((y >> 4) << 4);
+						double lz = oz + dz * tn - ((z >> 4) << 4);
+						int bi = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+						if (!s.attenuate(bi, lx, ly, lz, dx, dy, dz, len, acc)) {
+							acc[0] = acc[1] = acc[2] = 0f;
+							break;
+						}
+					}
+				}
+			}
+
+			// ---- step to the next block
 			if (tMaxX < tMaxY) {
 				if (tMaxX < tMaxZ) {
 					tn = tMaxX;
@@ -330,30 +386,68 @@ public final class VoxelLighting {
 				z += stepZ;
 				tMaxZ += invZ;
 			}
-			if (tn > maxLen) break;
-			if (y < minY || y >= maxY) break; // left the world vertically: nothing more to hit
-			if (x == tx && y == ty && z == tz) break; // arrived at the emitter block
-
-			// The exit of the current block is the next crossing, whichever it is.
-			double exitD = Math.min(tMaxX, Math.min(tMaxY, tMaxZ));
-			double len = Math.min(exitD, maxLen) - tn;
-			if (len > 0) {
-				VoxelSection s = section(x, y, z);
-				if (s != null && s.loadState == VoxelSection.READY && (s.opaque != null || s.ptype != null
-						|| s.foliage != null || s.glass != null)) {
-					double lx = ox + dx * tn - ((x >> 4) << 4);
-					double ly = oy + dy * tn - ((y >> 4) << 4);
-					double lz = oz + dz * tn - ((z >> 4) << 4);
-					int bi = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
-					if (!s.attenuate(bi, lx, ly, lz, dx, dy, dz, len, acc)) {
-						acc[0] = acc[1] = acc[2] = 0f;
-						break;
-					}
-				}
-			}
+			evaluate = true;
 		}
 		trR = acc[0];
 		trG = acc[1];
 		trB = acc[2];
+	}
+
+	private static final double BLOCKED = -2;
+
+	/**
+	 * Octree descent for the section containing block (x,y,z): returns the distance at which
+	 * the ray leaves the largest empty cell around the current block (whole empty section,
+	 * 8^3 half, 4^3 or 2^3 cell), BLOCKED for an all-opaque section, or -1 when nothing
+	 * can be skipped. Never skips a cell containing the target block.
+	 */
+	private double svoSkip(int x, int y, int z, double ox, double oy, double oz,
+						   double dx, double dy, double dz, double invX, double invY, double invZ,
+						   int tx, int ty, int tz) {
+		VoxelSection s = section(x, y, z);
+		int sx = (x >> 4) << 4, sy = (y >> 4) << 4, sz = (z >> 4) << 4;
+		if (s == null || s.occ1 == null) {
+			if (inCell(tx, ty, tz, sx, sy, sz, 16)) return -1;
+			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx, sy, sz, 16);
+		}
+		if (s.allOpaque) {
+			if (inCell(tx, ty, tz, sx, sy, sz, 16)) return -1;
+			return BLOCKED;
+		}
+		int cx = x & 15, cy = y & 15, cz = z & 15;
+		int i1 = ((cy >> 3) << 2) | ((cz >> 3) << 1) | (cx >> 3);
+		if ((s.occ1[0] & (1L << i1)) == 0L) {
+			if (inCell(tx, ty, tz, sx + (cx & -8), sy + (cy & -8), sz + (cz & -8), 8)) return -1;
+			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx + (cx & -8), sy + (cy & -8), sz + (cz & -8), 8);
+		}
+		int i2 = ((cy >> 2) << 4) | ((cz >> 2) << 2) | (cx >> 2);
+		if ((s.occ2[0] & (1L << i2)) == 0L) {
+			if (inCell(tx, ty, tz, sx + (cx & -4), sy + (cy & -4), sz + (cz & -4), 4)) return -1;
+			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx + (cx & -4), sy + (cy & -4), sz + (cz & -4), 4);
+		}
+		int i3 = ((cy >> 1) << 6) | ((cz >> 1) << 3) | (cx >> 1);
+		if ((s.occ3[i3 >>> 6] & (1L << (i3 & 63))) == 0L) {
+			if (inCell(tx, ty, tz, sx + (cx & -2), sy + (cy & -2), sz + (cz & -2), 2)) return -1;
+			return cellExit(ox, oy, oz, dx, dy, dz, invX, invY, invZ, sx + (cx & -2), sy + (cy & -2), sz + (cz & -2), 2);
+		}
+		return -1;
+	}
+
+	/** Ray distance at which the ray exits the axis-aligned cell [b, b+size) on any axis. */
+	private static double cellExit(double ox, double oy, double oz, double dx, double dy, double dz,
+								   double invX, double invY, double invZ,
+								   double bx, double by, double bz, double size) {
+		double d = Double.POSITIVE_INFINITY;
+		if (dx > 0) d = Math.min(d, (bx + size - ox) * invX);
+		else if (dx < 0) d = Math.min(d, (ox - bx) * invX);
+		if (dy > 0) d = Math.min(d, (by + size - oy) * invY);
+		else if (dy < 0) d = Math.min(d, (oy - by) * invY);
+		if (dz > 0) d = Math.min(d, (bz + size - oz) * invZ);
+		else if (dz < 0) d = Math.min(d, (oz - bz) * invZ);
+		return d;
+	}
+
+	private static boolean inCell(int tx, int ty, int tz, double bx, double by, double bz, double size) {
+		return tx >= bx && tx < bx + size && ty >= by && ty < by + size && tz >= bz && tz < bz + size;
 	}
 }
