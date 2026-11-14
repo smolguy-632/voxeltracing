@@ -4,7 +4,6 @@ import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.blaze3d.vertex.VertexFormat;
-import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import net.minecraft.util.Mth;
 
 import java.util.Arrays;
@@ -54,13 +53,87 @@ final class SectionBaker {
 	private final VoxelLighting vl;
 	private BufferBuilder builder;
 
-	/** Per-bake cache: fixed-point corner position (1/16-block units) -> traced light. */
-	private final Long2ObjectOpenHashMap<Vert> vcache = new Long2ObjectOpenHashMap<>();
+	// ------------------------------------------------------------------ corner cache
+	// Flat open-addressing table with structure-of-arrays values: no per-corner objects, no
+	// pointer chasing, zero allocation while tracing. Sentinel -1 in cSunR / cBR marks an
+	// inserted-but-not-yet-traced corner.
 
-	private int[] qPos = new int[16384];
-	private int[] qSub = new int[16384];
-	private int[] qCol = new int[16384 * 4]; // 4 vertex colours per quad
-	private int quads;
+	private long[] cKey = new long[1 << 13];
+	private byte[] cUsed = new byte[1 << 13];
+	private float[] cSunR = new float[1 << 13], cSunG = new float[1 << 13], cSunB = new float[1 << 13];
+	private float[] cBR = new float[1 << 13], cBG = new float[1 << 13], cBB = new float[1 << 13], cP = new float[1 << 13];
+	private int cMask = (1 << 13) - 1;
+	private int cCount;
+
+	private static int mix(long k) {
+		k ^= k >>> 33;
+		k *= 0xff51afd7ed558ccdL;
+		k ^= k >>> 33;
+		k *= 0xc4ceb9fe1a85ec53L;
+		k ^= k >>> 33;
+		return (int) k;
+	}
+
+	/** Slot for a fixed-point corner position; inserts (with -1 sentinels) when absent. */
+	private int cornerSlot(long key) {
+		if (cCount * 3 >= cKey.length * 2) grow();
+		int i = mix(key) & cMask;
+		while (cUsed[i] != 0) {
+			if (cKey[i] == key) return i;
+			i = (i + 1) & cMask;
+		}
+		cUsed[i] = 1;
+		cKey[i] = key;
+		cSunR[i] = -1f;
+		cBR[i] = -1f;
+		cCount++;
+		return i;
+	}
+
+	private void grow() {
+		long[] oKey = cKey;
+		byte[] oUsed = cUsed;
+		float[] oSunR = cSunR, oSunG = cSunG, oSunB = cSunB;
+		float[] oBR = cBR, oBG = cBG, oBB = cBB, oP = cP;
+		int old = oKey.length;
+		int cap = old << 1;
+		cKey = new long[cap];
+		cUsed = new byte[cap];
+		cSunR = new float[cap];
+		cSunG = new float[cap];
+		cSunB = new float[cap];
+		cBR = new float[cap];
+		cBG = new float[cap];
+		cBB = new float[cap];
+		cP = new float[cap];
+		cMask = cap - 1;
+		cCount = 0;
+		for (int j = 0; j < old; j++) {
+			if (oUsed[j] == 0) continue;
+			long key = oKey[j];
+			int i = mix(key) & cMask;
+			while (cUsed[i] != 0) i = (i + 1) & cMask;
+			cUsed[i] = 1;
+			cKey[i] = key;
+			cSunR[i] = oSunR[j];
+			cSunG[i] = oSunG[j];
+			cSunB[i] = oSunB[j];
+			cBR[i] = oBR[j];
+			cBG[i] = oBG[j];
+			cBB[i] = oBB[j];
+			cP[i] = oP[j];
+			cCount++;
+		}
+	}
+
+	SectionBaker(VoxelLighting vl) {
+		this.vl = vl;
+	}
+
+	/** Fixed-point corner position (1/16-block units). No practical collisions within a loaded area. */
+	private static long vkey(int x, int y, int z) {
+		return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFF) << 16) | (long) (y & 0xFFFF);
+	}
 
 	// Emitter candidates for the section being baked
 	private final float[] cx = new float[MAX_CAND], cy = new float[MAX_CAND], cz = new float[MAX_CAND], cl = new float[MAX_CAND];
@@ -80,32 +153,11 @@ final class SectionBaker {
 	private int fKx0, fKy0, fKz0;
 	private int fUx, fUy, fUz, fVx, fVy, fVz;
 	private float fDot;
-
-	/** Traced light of one corner vertex. A -1 sentinel on sunR / bR means "not computed yet". */
-	private static final class Vert {
-		float sunR = -1f, sunG, sunB; // transmittance towards the sun, per channel
-		float bR = -1f, bG, bB;       // torch light that actually arrives, per channel
-		float p;                      // torch light that would arrive with no blockers
-	}
-
-	SectionBaker(VoxelLighting vl) {
-		this.vl = vl;
-	}
-
-	/** Fixed-point corner position (1/16-block units). No practical collisions within a loaded area. */
-	private static long vkey(int x, int y, int z) {
-		return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFF) << 16) | (long) (y & 0xFFFF);
-	}
-
-	private Vert vertex(int x, int y, int z) {
-		long k = vkey(x, y, z);
-		Vert v = vcache.get(k);
-		if (v == null) {
-			v = new Vert();
-			vcache.put(k, v);
-		}
-		return v;
-	}
+	// Quad accumulation
+	private int[] qPos = new int[16384];
+	private int[] qSub = new int[16384];
+	private int[] qCol = new int[16384 * 4]; // 4 vertex colours per quad
+	private int quads;
 
 	void bake(VoxelSection s, VtConfig cfg) {
 		if (s.loadState == VoxelSection.NOT_TRIED) s.load(vl.level);
@@ -126,7 +178,9 @@ final class SectionBaker {
 			return;
 		}
 
-		vcache.clear();
+		// reset the flat corner cache (keep grown capacity)
+		Arrays.fill(cUsed, (byte) 0);
+		cCount = 0;
 
 		this.cfg = cfg;
 		this.sunOn = sunOn;
@@ -228,28 +282,28 @@ final class SectionBaker {
 			if (fDot <= 0f) {
 				sr = sg = sb = cfg.selfShade;
 			} else {
-				Vert vt = vertex(kx, ky, kz);
-				if (vt.sunR < 0f) {
+				int slot = cornerSlot(vkey(kx, ky, kz));
+				if (cSunR[slot] < 0f) {
 					vl.trace(wx, wy, wz, lx, ly, lz, cfg.quality.rayRange, VoxelLighting.NO_TARGET, 0, 0);
-					vt.sunR = vl.trR;
-					vt.sunG = vl.trG;
-					vt.sunB = vl.trB;
+					cSunR[slot] = vl.trR;
+					cSunG[slot] = vl.trG;
+					cSunB[slot] = vl.trB;
 				}
-				sr = crisp((1f - vt.sunR) * cfg.shadowStrength * strength);
-				sg = crisp((1f - vt.sunG) * cfg.shadowStrength * strength);
-				sb = crisp((1f - vt.sunB) * cfg.shadowStrength * strength);
+				sr = crisp((1f - cSunR[slot]) * cfg.shadowStrength * strength);
+				sg = crisp((1f - cSunG[slot]) * cfg.shadowStrength * strength);
+				sb = crisp((1f - cSunB[slot]) * cfg.shadowStrength * strength);
 			}
 		}
 
 		// ---- block light (per channel)
 		float br = 0f, bg = 0f, bb = 0f, p = 0f;
 		if (lightOn) {
-			Vert vt = vertex(kx, ky, kz);
-			if (vt.bR < 0f) vertexLight(wx, wy, wz, vt);
-			br = vt.bR;
-			bg = vt.bG;
-			bb = vt.bB;
-			p = vt.p;
+			int slot = cornerSlot(vkey(kx, ky, kz));
+			if (cBR[slot] < 0f) vertexLight(slot, wx, wy, wz);
+			br = cBR[slot];
+			bg = cBG[slot];
+			bb = cBB[slot];
+			p = cP[slot];
 		}
 
 		// Per-channel darkness (sun occlusion + torch occlusion) and warm glow.
@@ -328,8 +382,8 @@ final class SectionBaker {
 		}
 	}
 
-	/** Traces the nearby emitters from one corner vertex; fills v.b* (arrives) and v.p (no blockers). */
-	private void vertexLight(float ox, float oy, float oz, Vert v) {
+	/** Traces the nearby emitters for one corner (writes cBR/cBG/cBB/cP at its cache slot). */
+	private void vertexLight(int slot, float ox, float oy, float oz) {
 		final int kmax = Math.min(cfg.quality.lightRays, 8);
 		int k = 0;
 		for (int c = 0; c < candCount; c++) {
@@ -369,10 +423,10 @@ final class SectionBaker {
 			keepB_g *= 1f - str * tg;
 			keepB_b *= 1f - str * tb;
 		}
-		v.bR = 1f - keepB_r;
-		v.bG = 1f - keepB_g;
-		v.bB = 1f - keepB_b;
-		v.p = 1f - keepP;
+		cBR[slot] = 1f - keepB_r;
+		cBG[slot] = 1f - keepB_g;
+		cBB[slot] = 1f - keepB_b;
+		cP[slot] = 1f - keepP;
 	}
 
 	// ------------------------------------------------------------------ mesh
